@@ -17,6 +17,16 @@ import io
 from datetime import datetime
 import threading
 
+# PDF 生成
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.units import cm, inch
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
 # Windows 编码
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -398,26 +408,98 @@ def process_zip_file(zip_path: str, extractor: InvoiceExtractor) -> list:
 
 @app.route('/api/download/<session_id>', methods=['GET'])
 def download_results(session_id):
-    """下载重命名列表"""
+    """下载重命名列表为 PDF"""
     if session_id not in UPLOAD_RESULTS:
         return jsonify({'error': '会话已过期'}), 400
 
     session_data = UPLOAD_RESULTS[session_id]
     results = session_data['results']
 
-    output_zip = io.BytesIO()
+    # 生成 PDF
+    pdf_buffer = io.BytesIO()
+    doc = SimpleDocTemplate(pdf_buffer, pagesize=A4, encoding='utf-8')
 
-    with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as z:
-        # 添加重命名列表
-        z.writestr("重命名列表.txt", generate_list_text(results))
+    # 样式
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=16,
+        textColor=colors.HexColor('#667eea'),
+        spaceAfter=20,
+        alignment=TA_CENTER
+    )
 
-    output_zip.seek(0)
+    # 内容
+    story = []
+
+    # 标题
+    story.append(Paragraph('发票批量重命名结果', title_style))
+    story.append(Spacer(1, 0.3*cm))
+
+    # 统计信息
+    total = len(results)
+    success = len([r for r in results if r['status'] == 'success'])
+    failed = total - success
+
+    summary_text = f'总文件数: {total} &nbsp;&nbsp; 成功识别: {success} &nbsp;&nbsp; 识别失败: {failed}'
+    story.append(Paragraph(summary_text, styles['Normal']))
+    story.append(Spacer(1, 0.5*cm))
+
+    # 表格数据
+    table_data = [['原文件名', '新文件名', '日期', '发票号', '购买方', '销售方', '金额']]
+
+    for item in results:
+        if item['status'] == 'success':
+            data = item.get('data', {})
+            row = [
+                item.get('filename', '-')[:20],
+                item.get('new_name', '-')[:25],
+                data.get('date', '-'),
+                data.get('invoice_number', '-')[:15],
+                data.get('buyer', '-')[:15],
+                data.get('supplier', '-')[:15],
+                data.get('amount', '-')
+            ]
+        else:
+            row = [
+                item.get('filename', '-')[:20],
+                f"错误: {item.get('error', '-')}"[:40],
+                '-', '-', '-', '-', '-'
+            ]
+        table_data.append(row)
+
+    # 创建表格
+    table = Table(table_data, colWidths=[1.8*cm, 2.2*cm, 1.5*cm, 1.8*cm, 1.8*cm, 1.8*cm, 1.2*cm])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#667eea')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f3ff')])
+    ]))
+
+    story.append(table)
+    story.append(Spacer(1, 0.5*cm))
+
+    # 生成时间
+    time_text = f'生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+    story.append(Paragraph(time_text, styles['Normal']))
+
+    # 构建 PDF
+    doc.build(story)
+    pdf_buffer.seek(0)
 
     return send_file(
-        output_zip,
-        mimetype='application/zip',
+        pdf_buffer,
+        mimetype='application/pdf',
         as_attachment=True,
-        download_name=f'发票重命名列表_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+        download_name=f'发票重命名结果_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
     )
 
 
