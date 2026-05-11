@@ -253,6 +253,50 @@ def debug_ocr(session_id):
     })
 
 
+@app.route('/api/debug-ocr', methods=['POST'])
+def debug_ocr_endpoint():
+    """调试端点：返回原始 OCR 文本"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': '未选择文件'}), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': '未选择文件'}), 400
+
+        if not READER_READY:
+            return jsonify({'error': 'OCR 还未初始化'}), 503
+
+        ext = Path(file.filename).suffix.lower()
+        if ext not in {'.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif'}:
+            return jsonify({'error': '不支持的格式'}), 400
+
+        temp_path = os.path.join(tempfile.gettempdir(), file.filename)
+        file.save(temp_path)
+
+        try:
+            extractor = InvoiceExtractor(READER)
+            data = extractor.extract(temp_path)
+
+            return jsonify({
+                'filename': file.filename,
+                'raw_text': data.get('_raw_text', ''),
+                'extracted': {
+                    'date': data.get('date'),
+                    'invoice_number': data.get('invoice_number'),
+                    'buyer': data.get('buyer'),
+                    'supplier': data.get('supplier'),
+                    'amount': data.get('amount')
+                }
+            })
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     """处理上传"""
