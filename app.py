@@ -34,12 +34,20 @@ if sys.platform == 'win32':
 import easyocr
 import cv2
 import numpy as np
+from PIL import Image
+from io import BytesIO
 
-# 兼容 PyMuPDF 导入
+# 尝试使用 pdf2image，如果失败则使用 fitz
 try:
-    import fitz
+    from pdf2image import convert_from_path
+    HAS_PDF2IMAGE = True
 except ImportError:
-    import pymupdf as fitz
+    HAS_PDF2IMAGE = False
+    try:
+        import pymupdf
+        HAS_FITZ = True
+    except ImportError:
+        HAS_FITZ = False
 
 # ======================== 发票提取 ========================
 
@@ -50,32 +58,40 @@ class InvoiceExtractor:
         self.reader = reader
 
     def _pdf_to_image(self, pdf_path: str) -> np.ndarray:
+        """PDF 转图片 - 多种方法尝试"""
         try:
-            # 使用 fitz.open() 打开 PDF
-            try:
-                doc = fitz.open(pdf_path)
-            except AttributeError:
-                # 备选：使用绝对路径的 open
-                import pymupdf
-                doc = pymupdf.open(pdf_path)
+            # 方法 1: 使用 pdf2image
+            if HAS_PDF2IMAGE:
+                try:
+                    images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=150)
+                    if images:
+                        image = images[0]
+                        image_array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                        return image_array
+                except Exception as e:
+                    print(f"pdf2image 失败: {e}")
 
-            if len(doc) == 0:
-                raise Exception("PDF 没有页面")
+            # 方法 2: 使用 PyMuPDF
+            if HAS_FITZ:
+                try:
+                    import pymupdf
+                    doc = pymupdf.open(pdf_path)
+                    page = doc[0]
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5))
+                    image_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                        pix.height, pix.width, pix.n
+                    )
+                    if pix.n == 3:
+                        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+                    elif pix.n == 4:
+                        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
+                    doc.close()
+                    return image_array
+                except Exception as e:
+                    print(f"PyMuPDF 失败: {e}")
 
-            page = doc[0]
-            # 提高分辨率以获得更好的 OCR 效果
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+            raise Exception("无法转换 PDF：既没有 pdf2image 也没有 PyMuPDF")
 
-            image_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                pix.height, pix.width, pix.n
-            )
-            if pix.n == 3:
-                image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
-            elif pix.n == 4:
-                image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
-
-            doc.close()
-            return image_array
         except Exception as e:
             raise Exception(f"PDF 转图片失败: {e}")
 
