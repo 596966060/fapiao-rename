@@ -198,23 +198,43 @@ class InvoiceExtractor:
             result["buyer"] = unique_companies[0]
 
         # === 金额 ===
-        # 优先级：价税合计(最终) > 小写标签 > 普通¥符号 > 元后缀 > 合计
+        # 关键：优先找"价税合计(小写)" - 这是最终价格！
+        # OCR可能把字符识别错（如¥识别为垩/垒/Y等），需要宽松匹配
         amount_patterns = [
-            r'(?:价税)?合计[（(]*小写[）)]*\s*[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',  # 最优先！
-            r'小写[）)]*\s*[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',
-            r'[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',
-            r'([0-9]{1,10}\.[0-9]{2})\s*元',
-            r'合[計计]\s*[¥￥垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
+            # 最优先：(小写) 后面的数字 - 通常是最终价格
+            r'小写[）)]*\s*[垒¥￥垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
+            # 次优先：任意¥符号后的数字
+            r'[¥￥垩圓Y垒]\s*([0-9]{1,10}\.[0-9]{2})',
+            # 备选：任意小数数字
+            r'([0-9]{1,10}\.[0-9]{2})',
+            # 中文句号格式的小数
+            r'([0-9]{1,10})[。.]([0-9]{1,2})',
         ]
 
         for pattern in amount_patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                try:
-                    result["amount"] = str(max(float(m) for m in matches))
-                    break
-                except:
-                    pass
+            if '。' in pattern or '[。.]' in pattern:
+                # 特殊处理中文句号格式
+                matches = re.findall(pattern, text)
+                if matches:
+                    try:
+                        amounts = []
+                        for m in matches:
+                            if isinstance(m, tuple):
+                                amounts.append(f"{m[0]}.{m[1]}")
+                            else:
+                                amounts.append(m)
+                        result["amount"] = str(max(float(a) for a in amounts if a))
+                        break
+                    except:
+                        pass
+            else:
+                matches = re.findall(pattern, text)
+                if matches:
+                    try:
+                        result["amount"] = str(max(float(m) for m in matches))
+                        break
+                    except:
+                        pass
 
         return result
 
