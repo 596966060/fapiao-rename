@@ -154,8 +154,9 @@ class InvoiceExtractor:
                 result["invoice_number"] = all_numbers[0]
 
         # ===== 购买方和销售方提取 =====
-        # 策略：找所有企业名（包含"公司"、"有限"、"集团"等关键字）
-        company_pattern = r'[\u4e00-\u9fa5]+(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心|所|室|部|局|委|院)[\u4e00-\u9fa5]*'
+        # 策略：按企业名在文本中出现的顺序（购买方通常在前，销售方在后）
+        # 不依赖OCR标签（容易被误识为"1称"、"恪称"等）
+        company_pattern = r'[\u4e00-\u9fa5]+(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心)'
         companies = re.findall(company_pattern, text)
 
         # 去重同时保留顺序
@@ -163,35 +164,15 @@ class InvoiceExtractor:
         unique_companies = []
         for c in companies:
             c = c.strip()
-            if len(c) >= 3 and c not in seen and '统一' not in c and '税号' not in c:
-                seen.add(c)
-                unique_companies.append(c)
+            if 3 <= len(c) <= 100 and c not in seen:
+                if '统一' not in c and '税号' not in c and '社会' not in c:
+                    seen.add(c)
+                    unique_companies.append(c)
 
-        # 最多取前两个不同的企业名
         if len(unique_companies) >= 2:
-            # 根据"购买方"和"销售方"的位置判断顺序
-            buyer_idx = text.find('购买')
-            supplier_idx = text.find('销售')
-
-            # 如果都找不到，用"买"和"卖"
-            if buyer_idx == -1:
-                buyer_idx = text.find('买')
-            if supplier_idx == -1:
-                supplier_idx = text.find('卖')
-
-            if buyer_idx >= 0 and supplier_idx >= 0:
-                if buyer_idx < supplier_idx:
-                    result["buyer"] = unique_companies[0]
-                    result["supplier"] = unique_companies[1]
-                else:
-                    result["supplier"] = unique_companies[0]
-                    result["buyer"] = unique_companies[1]
-            else:
-                # 如果找不到标记，就按顺序
-                result["buyer"] = unique_companies[0]
-                if len(unique_companies) > 1:
-                    result["supplier"] = unique_companies[1]
-
+            # 按顺序：第一个是购买方，第二个是销售方
+            result["buyer"] = unique_companies[0]
+            result["supplier"] = unique_companies[1]
         elif len(unique_companies) == 1:
             result["buyer"] = unique_companies[0]
 
