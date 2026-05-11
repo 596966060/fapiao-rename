@@ -60,12 +60,13 @@ class InvoiceExtractor:
             raise Exception(f"图片读取失败: {e}")
 
     def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """图像预处理 - 只做对比度增强，不做二值化（会导致OCR输出错误）"""
+        """图像预处理 - 仅做对比度增强，不做二值化（会破坏OCR）"""
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            # 自适应对比度增强
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(gray)
-            # 直接返回增强后的灰度图，不做二值化/降噪（会破坏OCR质量）
+            # 返回增强后的灰度图转BGR
             return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
         except:
             return image
@@ -197,14 +198,13 @@ class InvoiceExtractor:
             result["buyer"] = unique_companies[0]
 
         # === 金额 ===
-        # 方式1：优先找 "小写" 标签后的金额（最准确）
-        # 方式2：货币符号后的金额
-        # 方式3：元后缀
+        # 优先级：价税合计(最终) > 小写标签 > 普通¥符号 > 元后缀 > 合计
         amount_patterns = [
+            r'(?:价税)?合计[（(]*小写[）)]*\s*[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',  # 最优先！
             r'小写[）)]*\s*[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',
             r'[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',
             r'([0-9]{1,10}\.[0-9]{2})\s*元',
-            r'合[計计]\s*[¥￥垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',  # 合计行
+            r'合[計计]\s*[¥￥垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
         ]
 
         for pattern in amount_patterns:
