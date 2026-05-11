@@ -547,13 +547,25 @@
             const fileList = document.getElementById('fileList');
             fileList.innerHTML = '';
 
-            data.results.forEach(item => {
+            // 调试：输出所有数据到控制台
+            console.log('=== OCR DEBUG INFO ===');
+            console.log('Raw Results:', JSON.stringify(data.results, null, 2));
+
+            data.results.forEach((item, idx) => {
                 const div = document.createElement('div');
                 div.className = `file-item ${item.status}`;
 
                 if (item.status === 'success') {
                     const data_obj = item.data || {};
-                    const rawText = data_obj._raw_text ? `<button style="margin-top: 10px; padding: 5px 10px; font-size: 12px; background: #667eea; color: white; border: none; border-radius: 4px; cursor: pointer;" onclick="alert('原始 OCR 文本:\\n\\n' + ${JSON.stringify(data_obj._raw_text)})">查看原始 OCR 文本</button>` : '';
+
+                    // 输出原始文本到控制台
+                    if (data_obj._raw_text) {
+                        console.log(`\n--- File ${idx + 1}: ${item.filename} ---`);
+                        console.log('Raw OCR Text:');
+                        console.log(data_obj._raw_text);
+                    }
+
+                    const rawText = data_obj._raw_text ? `<div style="margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 4px; font-size: 11px; color: #666; max-height: 150px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;">${data_obj._raw_text}</div>` : '';
                     div.innerHTML = `
                         <div class="file-name">📄 ${item.filename || 'Unknown'}</div>
                         <div class="file-new-name">✓ ${item.new_name || 'No name'}</div>
@@ -575,7 +587,7 @@
                             </div>
                         </div>
                         <span class="file-status success">✓ 识别成功</span>
-                        ${rawText}
+                        ${rawText ? `<details style="margin-top: 10px;"><summary style="cursor: pointer; color: #667eea;">📋 查看原始 OCR 文本</summary>${rawText}</details>` : ''}
                     `;
                 } else {
                     const errorMsg = item.error || 'Unknown error';
