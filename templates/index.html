@@ -517,6 +517,8 @@
             .then(data => {
                 if (data.error) {
                     showStatus(`❌ ${data.error}`, 'error');
+                } else if (!data.session_id || !data.results) {
+                    showStatus(`❌ 服务器返回数据异常`, 'error');
                 } else {
                     currentSessionId = data.session_id;
                     uploadedResults = data.results;
@@ -550,32 +552,34 @@
                 div.className = `file-item ${item.status}`;
 
                 if (item.status === 'success') {
+                    const data_obj = item.data || {};
                     div.innerHTML = `
-                        <div class="file-name">📄 ${item.filename}</div>
-                        <div class="file-new-name">✓ ${item.new_name}</div>
+                        <div class="file-name">📄 ${item.filename || 'Unknown'}</div>
+                        <div class="file-new-name">✓ ${item.new_name || 'No name'}</div>
                         <div class="file-fields">
                             <div class="field">
-                                <span class="field-label">日期:</span> ${item.data.date || '-'}
+                                <span class="field-label">日期:</span> ${data_obj.date || '-'}
                             </div>
                             <div class="field">
-                                <span class="field-label">号码:</span> ${item.data.invoice_number || '-'}
+                                <span class="field-label">号码:</span> ${data_obj.invoice_number || '-'}
                             </div>
                             <div class="field">
-                                <span class="field-label">购买方:</span> ${item.data.buyer || '-'}
+                                <span class="field-label">购买方:</span> ${data_obj.buyer || '-'}
                             </div>
                             <div class="field">
-                                <span class="field-label">销售方:</span> ${item.data.supplier || '-'}
+                                <span class="field-label">销售方:</span> ${data_obj.supplier || '-'}
                             </div>
                             <div class="field">
-                                <span class="field-label">金额:</span> ${item.data.amount || '-'}
+                                <span class="field-label">金额:</span> ${data_obj.amount || '-'}
                             </div>
                         </div>
                         <span class="file-status success">✓ 识别成功</span>
                     `;
                 } else {
+                    const errorMsg = item.error || 'Unknown error';
                     div.innerHTML = `
-                        <div class="file-name">❌ ${item.filename}</div>
-                        <span class="file-status error">✗ ${item.error}</span>
+                        <div class="file-name">❌ ${item.filename || 'Unknown'}</div>
+                        <span class="file-status error">✗ ${errorMsg}</span>
                     `;
                 }
                 fileList.appendChild(div);

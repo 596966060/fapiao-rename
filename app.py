@@ -153,7 +153,10 @@ def generate_filename(data: dict, original_ext: str) -> str:
     new_name = f"{date}_{invoice_num}_{buyer}_{supplier}_{amount}元{original_ext}"
     new_name = re.sub(r'[\\/:*?"<>|]', '', new_name)
     new_name = re.sub(r'_+', '_', new_name)
-    return new_name.strip('_ ')
+    new_name = new_name.strip('_ ')
+
+    # 确保返回非空字符串
+    return new_name if new_name else f"invoice_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
 
 
 # ======================== Flask 应用 ========================
@@ -253,8 +256,8 @@ def upload_file():
                     new_name = generate_filename(data, ext)
                     results.append({
                         'filename': file.filename,
-                        'new_name': new_name,
-                        'data': data,
+                        'new_name': new_name or 'Unknown',
+                        'data': data or {},
                         'status': 'success'
                     })
             except Exception as e:
@@ -305,8 +308,8 @@ def process_zip_file(zip_path: str, extractor: InvoiceExtractor) -> list:
                         new_name = generate_filename(data, ext)
                         results.append({
                             'filename': file,
-                            'new_name': new_name,
-                            'data': data,
+                            'new_name': new_name or 'Unknown',
+                            'data': data or {},
                             'status': 'success'
                         })
                     except Exception as e:
@@ -323,7 +326,7 @@ def process_zip_file(zip_path: str, extractor: InvoiceExtractor) -> list:
 
 @app.route('/api/download/<session_id>', methods=['GET'])
 def download_results(session_id):
-    """下载重命名后的文件"""
+    """下载重命名列表"""
     if session_id not in UPLOAD_RESULTS:
         return jsonify({'error': '会话已过期'}), 400
 
@@ -333,10 +336,8 @@ def download_results(session_id):
     output_zip = io.BytesIO()
 
     with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as z:
-        for item in results:
-            if item['status'] == 'success':
-                z.writestr(f"重命名列表.txt", generate_list_text(results))
-                break
+        # 添加重命名列表
+        z.writestr("重命名列表.txt", generate_list_text(results))
 
     output_zip.seek(0)
 
@@ -344,7 +345,7 @@ def download_results(session_id):
         output_zip,
         mimetype='application/zip',
         as_attachment=True,
-        download_name=f'发票重命名_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+        download_name=f'发票重命名列表_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
     )
 
 
