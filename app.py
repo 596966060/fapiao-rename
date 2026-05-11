@@ -112,32 +112,59 @@ class InvoiceExtractor:
 
         # 发票号
         for pattern in [r'发票(?:代)?号[码]*[：:\s]*([0-9]{6,20})',
-                        r'编号[：\s]*([0-9]{6,20})']:
+                        r'编号[：\s]*([0-9]{6,20})',
+                        r'([0-9]{6,20})']:
             match = re.search(pattern, text)
             if match and 6 <= len(match.group(1)) <= 20:
                 result["invoice_number"] = match.group(1)
                 break
 
-        # 销售方和购买方
+        # 销售方和购买方 - 改进版本
         lines = text.split('\n')
+
         for line in lines:
             line_stripped = line.strip()
-            if re.search(r'销售方|卖方', line_stripped):
-                match = re.search(r'[销卖][方者]?[：\s]*([^\n：]{2,80})', line_stripped)
-                if match:
-                    result["supplier"] = match.group(1).strip()
-            if re.search(r'购买方|买方', line_stripped):
-                match = re.search(r'[购买][方者]?[：\s]*([^\n：]{2,80})', line_stripped)
-                if match:
-                    result["buyer"] = match.group(1).strip()
 
-        # 金额
-        for pattern in [r'合计[：\s]*[¥]?\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'[¥]\s*([0-9]{1,10}\.[0-9]{2})']:
+            # 销售方 - 多种标签格式
+            if re.search(r'销售方|卖方|供应商|出票人', line_stripped):
+                # 尝试多种分隔符
+                for sep in [r'[：:]', r'[\s]*', r'$']:
+                    match = re.search(rf'(?:销售方|卖方|供应商|出票人){sep}\s*([^\n：]{2,80})', line_stripped)
+                    if match:
+                        name = match.group(1).strip()
+                        # 过滤掉过短或明显不是公司名的
+                        if len(name) > 1 and not name.startswith('税'):
+                            result["supplier"] = name
+                            break
+                if result["supplier"]:
+                    break
+
+            # 购买方 - 多种标签格式
+            if re.search(r'购买方|买方|采购方|收票人', line_stripped):
+                for sep in [r'[：:]', r'[\s]*', r'$']:
+                    match = re.search(rf'(?:购买方|买方|采购方|收票人){sep}\s*([^\n：]{2,80})', line_stripped)
+                    if match:
+                        name = match.group(1).strip()
+                        if len(name) > 1 and not name.startswith('税'):
+                            result["buyer"] = name
+                            break
+                if result["buyer"]:
+                    break
+
+        # 金额 - 改进版本
+        # 优先匹配"合计"、"价税合计"
+        for pattern in [r'(?:价税)?合计[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+                        r'合:\s*([0-9]{1,10}\.[0-9]{2})',
+                        r'小计[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+                        r'[¥￥]\s*([0-9]{1,10}\.[0-9]{2})',
+                        r'([0-9]{1,10}\.[0-9]{2})元']:
             matches = re.findall(pattern, text)
             if matches:
-                result["amount"] = str(max(float(m) for m in matches))
-                break
+                try:
+                    result["amount"] = str(max(float(m) for m in matches))
+                    break
+                except:
+                    pass
 
         return result
 
@@ -205,6 +232,19 @@ def status():
     return jsonify({
         'ready': READER_READY,
         'message': 'OCR 已准备好' if READER_READY else '正在初始化 OCR 模型，请稍候...'
+    })
+
+
+@app.route('/api/debug/<session_id>')
+def debug_ocr(session_id):
+    """调试：查看原始 OCR 输出"""
+    if session_id not in UPLOAD_RESULTS:
+        return jsonify({'error': '会话已过期'}), 400
+
+    # 返回原始数据用于调试
+    return jsonify({
+        'session_id': session_id,
+        'results': UPLOAD_RESULTS[session_id]['results']
     })
 
 
