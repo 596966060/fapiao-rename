@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-发票批量重命名工具 - 纯网页版
+发票批量重命名工具 - 完全重写版
 支持批量上传、识别、重命名、下载
 """
 
@@ -17,99 +17,63 @@ import io
 from datetime import datetime
 import threading
 
+# PDF 和图像处理
+from PIL import Image
+import numpy as np
+import cv2
+
+# OCR
+import easyocr
+
 # PDF 生成
-from reportlab.lib.pagesizes import letter, A4
-from reportlab.lib.units import cm, inch
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 # Windows 编码
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-import easyocr
-import cv2
-import numpy as np
-from PIL import Image
-from io import BytesIO
-
-# 尝试使用 pdf2image，如果失败则使用 fitz
-try:
-    from pdf2image import convert_from_path
-    HAS_PDF2IMAGE = True
-except ImportError:
-    HAS_PDF2IMAGE = False
-    try:
-        import pymupdf
-        HAS_FITZ = True
-    except ImportError:
-        HAS_FITZ = False
-
-# ======================== 发票提取 ========================
+# ======================== 发票提取（简化版） ========================
 
 class InvoiceExtractor:
-    """发票 OCR 提取"""
+    """发票 OCR 提取 - 简化版"""
 
     def __init__(self, reader):
         self.reader = reader
 
     def _pdf_to_image(self, pdf_path: str) -> np.ndarray:
-        """PDF 转图片 - 多种方法尝试"""
+        """PDF 转图片 - 使用 pdf2image"""
         try:
-            # 方法 1: 使用 pdf2image
-            if HAS_PDF2IMAGE:
-                try:
-                    images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=150)
-                    if images:
-                        image = images[0]
-                        image_array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-                        return image_array
-                except Exception as e:
-                    print(f"pdf2image 失败: {e}")
-
-            # 方法 2: 使用 PyMuPDF
-            if HAS_FITZ:
-                try:
-                    import pymupdf
-                    doc = pymupdf.open(pdf_path)
-                    page = doc[0]
-                    pix = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5))
-                    image_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                        pix.height, pix.width, pix.n
-                    )
-                    if pix.n == 3:
-                        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
-                    elif pix.n == 4:
-                        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
-                    doc.close()
-                    return image_array
-                except Exception as e:
-                    print(f"PyMuPDF 失败: {e}")
-
-            raise Exception("无法转换 PDF：既没有 pdf2image 也没有 PyMuPDF")
-
+            from pdf2image import convert_from_path
+            images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=150)
+            if not images:
+                raise Exception("PDF 无法转换")
+            image = images[0]
+            return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        except ImportError:
+            raise Exception("缺少 pdf2image 库")
         except Exception as e:
             raise Exception(f"PDF 转图片失败: {e}")
 
     def _image_file_to_array(self, image_path: str) -> np.ndarray:
+        """图片转数组"""
         try:
-            image_bytes = np.fromfile(image_path, dtype=np.uint8)
-            image = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
-            if image is None:
-                raise Exception("无法读取图片")
-            return image
+            image = Image.open(image_path).convert('RGB')
+            return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         except Exception as e:
             raise Exception(f"图片读取失败: {e}")
 
     def extract(self, file_path: str) -> dict:
+        """提取发票信息"""
         try:
             file_path = Path(file_path)
             ext = file_path.suffix.lower()
 
+            # 转换为图片
             if ext == ".pdf":
                 image_array = self._pdf_to_image(str(file_path))
             else:
@@ -118,14 +82,8 @@ class InvoiceExtractor:
             if image_array is None or image_array.size == 0:
                 raise Exception("无法读取图像")
 
-            # 图像增强
-            gray = cv2.cvtColor(image_array, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(10, 10))
-            enhanced = clahe.apply(gray)
-            enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-
             # OCR
-            results = self.reader.readtext(enhanced_bgr, detail=0)
+            results = self.reader.readtext(image_array, detail=0)
             if not results:
                 raise Exception("OCR 无法识别")
 
@@ -133,13 +91,13 @@ class InvoiceExtractor:
 
             # 提取字段
             fields = self._extract_fields(text)
-            # 保存原始文本用于调试
             fields['_raw_text'] = text
             return fields
         except Exception as e:
             raise Exception(f"提取失败: {e}")
 
     def _extract_fields(self, text: str) -> dict:
+        """简化版字段提取"""
         result = {
             "date": None,
             "invoice_number": None,
@@ -148,82 +106,53 @@ class InvoiceExtractor:
             "amount": None,
         }
 
-        # 日期
-        match = re.search(r'(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})', text)
+        # 日期：YYYY-MM-DD 或类似格式
+        match = re.search(r'(\d{4})[\年\-/](\d{1,2})[\月\-/](\d{1,2})', text)
         if match:
             try:
-                year, month, day = match.groups()
-                year, m, d = int(year), int(month), int(day)
-                if 1900 <= year <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
-                    result["date"] = f"{year:04d}-{m:02d}-{d:02d}"
+                y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                if 1900 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
+                    result["date"] = f"{y:04d}-{m:02d}-{d:02d}"
             except:
                 pass
 
-        # 发票号 - 寻找长数字序列
-        matches = re.findall(r'\b\d{6,20}\b', text)
-        if matches:
-            for m in matches:
-                if 6 <= len(m) <= 20:
-                    result["invoice_number"] = m
-                    break
+        # 发票号：找最长的数字序列（6-20位）
+        all_numbers = re.findall(r'\d{6,20}', text)
+        if all_numbers:
+            result["invoice_number"] = all_numbers[0]
 
-        # 将文本分行处理
-        lines = text.split('\n')
+        # 购买方：在"购买方"后面找公司名
+        # 策略：找"购买方"或"名称"，然后取后面的汉字/符号组合
+        buyer_match = re.search(r'(?:购买方|买方)[：\s]*(.{0,5})?名称[：\s]*([^\n]{2,100})', text)
+        if not buyer_match:
+            buyer_match = re.search(r'购买方[信息]*[：\s]*([^\n]{2,100})', text)
+        if not buyer_match:
+            buyer_match = re.search(r'名称[：\s]*([^\n]{2,100})(?=\n|统一|税号)', text)
 
-        # 购买方 - 多种方式
-        for i, line in enumerate(lines):
-            # 方式 1: 找 "购买方" 开头的行
-            if '购买方' in line:
-                # 查看下面几行找公司名
-                for j in range(i, min(i+3, len(lines))):
-                    next_line = lines[j].strip()
-                    if '名称' in next_line or ('：' in next_line and len(next_line) > 10):
-                        match = re.search(r'[名称]*[：:]\s*(.{2,100}?)(?=$|[\n统一税号])', next_line)
-                        if match:
-                            buyer = match.group(1).strip()
-                            buyer = re.sub(r'[\n\s]+', '', buyer)
-                            if 3 <= len(buyer) <= 100 and '统一' not in buyer and '税号' not in buyer:
-                                result["buyer"] = buyer
-                                break
+        if buyer_match:
+            buyer = buyer_match.group(buyer_match.lastindex) if buyer_match.lastindex else buyer_match.group(1)
+            buyer = buyer.strip().replace('\n', '').replace(' ', '')[:80]
+            if 3 <= len(buyer) <= 100 and '统一' not in buyer and '税号' not in buyer:
+                result["buyer"] = buyer
 
-            # 方式 2: "购买方信息" 标签在同一行
-            match = re.search(r'购买方信息[：\s]*(.{2,100}?)(?=$|[\n统一税号])', line)
-            if match and not result["buyer"]:
-                buyer = match.group(1).strip()
-                buyer = re.sub(r'[\n\s]+', '', buyer)
-                if 3 <= len(buyer) <= 100:
-                    result["buyer"] = buyer
+        # 销售方：在"销售方"后面找公司名
+        supplier_match = re.search(r'(?:销售方|卖方)[：\s]*(.{0,5})?名称[：\s]*([^\n]{2,100})', text)
+        if not supplier_match:
+            supplier_match = re.search(r'销售方[信息]*[：\s]*([^\n]{2,100})', text)
 
-        # 销售方 - 多种方式
-        for i, line in enumerate(lines):
-            # 方式 1: 找 "销售方" 开头的行
-            if '销售方' in line:
-                for j in range(i, min(i+3, len(lines))):
-                    next_line = lines[j].strip()
-                    if '名称' in next_line or ('：' in next_line and len(next_line) > 10):
-                        match = re.search(r'[名称]*[：:]\s*(.{2,100}?)(?=$|[\n统一税号])', next_line)
-                        if match:
-                            supplier = match.group(1).strip()
-                            supplier = re.sub(r'[\n\s]+', '', supplier)
-                            if 3 <= len(supplier) <= 100 and '统一' not in supplier and '税号' not in supplier:
-                                result["supplier"] = supplier
-                                break
+        if supplier_match:
+            supplier = supplier_match.group(supplier_match.lastindex) if supplier_match.lastindex else supplier_match.group(1)
+            supplier = supplier.strip().replace('\n', '').replace(' ', '')[:80]
+            if 3 <= len(supplier) <= 100 and '统一' not in supplier and '税号' not in supplier:
+                result["supplier"] = supplier
 
-            # 方式 2: "销售方信息" 标签在同一行
-            match = re.search(r'销售方信息[：\s]*(.{2,100}?)(?=$|[\n统一税号])', line)
-            if match and not result["supplier"]:
-                supplier = match.group(1).strip()
-                supplier = re.sub(r'[\n\s]+', '', supplier)
-                if 3 <= len(supplier) <= 100:
-                    result["supplier"] = supplier
-
-        # 金额 - 优先级很高的模式
-        for pattern in [
-            r'价税合计[（(]小写[）)]?\s*[：:]\s*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+        # 金额：找"¥"或"元"或"合计"附近的数字
+        amount_patterns = [
             r'小写\s*[¥￥]\s*([0-9]{1,10}\.[0-9]{2})',
             r'[¥￥]\s*([0-9]{1,10}\.[0-9]{2})',
             r'([0-9]{1,10}\.[0-9]{2})\s*元',
-        ]:
+        ]
+        for pattern in amount_patterns:
             matches = re.findall(pattern, text)
             if matches:
                 try:
@@ -237,19 +166,16 @@ class InvoiceExtractor:
 
 def generate_filename(data: dict, original_ext: str) -> str:
     """生成新文件名"""
-    date = data.get('date') or '2026-01-01'
-    invoice_num = data.get('invoice_number') or '未知'
-    buyer = (data.get('buyer') or '')[:30]
-    supplier = (data.get('supplier') or '')[:30]
+    date = data.get('date') or '0000-01-01'
+    invoice_num = data.get('invoice_number') or '000000'
+    buyer = (data.get('buyer') or '')[:20]
+    supplier = (data.get('supplier') or '')[:20]
     amount = data.get('amount') or '0.00'
 
     new_name = f"{date}_{invoice_num}_{buyer}_{supplier}_{amount}元{original_ext}"
     new_name = re.sub(r'[\\/:*?"<>|]', '', new_name)
-    new_name = re.sub(r'_+', '_', new_name)
-    new_name = new_name.strip('_ ')
-
-    # 确保返回非空字符串
-    return new_name if new_name else f"invoice_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
+    new_name = re.sub(r'_+', '_', new_name).strip('_')
+    return new_name or f"invoice_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
 
 
 # ======================== Flask 应用 ========================
@@ -260,6 +186,7 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 READER = None
 READER_READY = False
 UPLOAD_RESULTS = {}
+
 
 def init_ocr_background():
     """后台初始化 OCR"""
@@ -272,19 +199,6 @@ def init_ocr_background():
     except Exception as e:
         print(f"❌ OCR 初始化失败: {e}")
         READER_READY = False
-
-def get_reader():
-    """获取 OCR reader，如未准备好则初始化"""
-    global READER, READER_READY
-
-    if READER_READY and READER is not None:
-        return READER
-
-    # 如果没有准备好，同步初始化
-    if READER is None:
-        init_ocr_background()
-
-    return READER
 
 
 @app.route('/')
@@ -301,63 +215,6 @@ def status():
     })
 
 
-@app.route('/api/debug/<session_id>')
-def debug_ocr(session_id):
-    """调试：查看原始 OCR 输出"""
-    if session_id not in UPLOAD_RESULTS:
-        return jsonify({'error': '会话已过期'}), 400
-
-    # 返回原始数据用于调试
-    return jsonify({
-        'session_id': session_id,
-        'results': UPLOAD_RESULTS[session_id]['results']
-    })
-
-
-@app.route('/api/debug-ocr', methods=['POST'])
-def debug_ocr_endpoint():
-    """调试端点：返回原始 OCR 文本"""
-    try:
-        if 'file' not in request.files:
-            return jsonify({'error': '未选择文件'}), 400
-
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': '未选择文件'}), 400
-
-        if not READER_READY:
-            return jsonify({'error': 'OCR 还未初始化'}), 503
-
-        ext = Path(file.filename).suffix.lower()
-        if ext not in {'.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif'}:
-            return jsonify({'error': '不支持的格式'}), 400
-
-        temp_path = os.path.join(tempfile.gettempdir(), file.filename)
-        file.save(temp_path)
-
-        try:
-            extractor = InvoiceExtractor(READER)
-            data = extractor.extract(temp_path)
-
-            return jsonify({
-                'filename': file.filename,
-                'raw_text': data.get('_raw_text', ''),
-                'extracted': {
-                    'date': data.get('date'),
-                    'invoice_number': data.get('invoice_number'),
-                    'buyer': data.get('buyer'),
-                    'supplier': data.get('supplier'),
-                    'amount': data.get('amount')
-                }
-            })
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     """处理上传"""
@@ -369,13 +226,11 @@ def upload_file():
             return jsonify({'error': 'OCR 还未初始化，请稍候片刻后重试'}), 503
 
         files = request.files.getlist('files[]')
-        reader = get_reader()
-
+        reader = READER
         if reader is None:
             return jsonify({'error': 'OCR 初始化失败'}), 500
 
         extractor = InvoiceExtractor(reader)
-
         results = []
         temp_dir = tempfile.gettempdir()
 
@@ -390,7 +245,7 @@ def upload_file():
                 results.append({
                     'filename': file.filename,
                     'status': 'error',
-                    'error': f'不支持的格式'
+                    'error': '不支持的格式'
                 })
                 continue
 
@@ -421,11 +276,8 @@ def upload_file():
                     os.remove(temp_path)
 
         # 保存结果
-        session_id = datetime.now().strftime('%Y%m%d%H%M%S')
-        UPLOAD_RESULTS[session_id] = {
-            'results': results,
-            'upload_dir': temp_dir
-        }
+        session_id = datetime.now().strftime('%Y%m%d%H%M%S%f')[-15:]
+        UPLOAD_RESULTS[session_id] = {'results': results}
 
         return jsonify({
             'session_id': session_id,
@@ -480,86 +332,62 @@ def download_results(session_id):
     if session_id not in UPLOAD_RESULTS:
         return jsonify({'error': '会话已过期'}), 400
 
-    session_data = UPLOAD_RESULTS[session_id]
-    results = session_data['results']
+    results = UPLOAD_RESULTS[session_id]['results']
 
     # 生成 PDF
     pdf_buffer = io.BytesIO()
     doc = SimpleDocTemplate(pdf_buffer, pagesize=A4, encoding='utf-8')
-
-    # 样式
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=16,
-        textColor=colors.HexColor('#667eea'),
-        spaceAfter=20,
-        alignment=TA_CENTER
-    )
-
-    # 内容
     story = []
 
     # 标题
+    title_style = ParagraphStyle(
+        'Title',
+        parent=styles['Heading1'],
+        fontSize=14,
+        textColor=colors.HexColor('#667eea'),
+        alignment=TA_CENTER,
+        spaceAfter=20
+    )
     story.append(Paragraph('发票批量重命名结果', title_style))
-    story.append(Spacer(1, 0.3*cm))
 
-    # 统计信息
+    # 统计
     total = len(results)
     success = len([r for r in results if r['status'] == 'success'])
     failed = total - success
-
-    summary_text = f'总文件数: {total} &nbsp;&nbsp; 成功识别: {success} &nbsp;&nbsp; 识别失败: {failed}'
-    story.append(Paragraph(summary_text, styles['Normal']))
+    story.append(Paragraph(f'总计: {total} | 成功: {success} | 失败: {failed}', styles['Normal']))
     story.append(Spacer(1, 0.5*cm))
 
-    # 表格数据
-    table_data = [['原文件名', '新文件名', '日期', '发票号', '购买方', '销售方', '金额']]
-
+    # 表格
+    table_data = [['原文件名', '新文件名', '日期', '发票号', '金额']]
     for item in results:
         if item['status'] == 'success':
             data = item.get('data', {})
-            row = [
-                item.get('filename', '-')[:20],
-                item.get('new_name', '-')[:25],
+            table_data.append([
+                item['filename'][:20],
+                item['new_name'][:30],
                 data.get('date', '-'),
-                data.get('invoice_number', '-')[:15],
-                data.get('buyer', '-')[:15],
-                data.get('supplier', '-')[:15],
+                data.get('invoice_number', '-')[:12],
                 data.get('amount', '-')
-            ]
+            ])
         else:
-            row = [
-                item.get('filename', '-')[:20],
-                f"错误: {item.get('error', '-')}"[:40],
-                '-', '-', '-', '-', '-'
-            ]
-        table_data.append(row)
+            table_data.append([
+                item['filename'][:20],
+                f"错误: {item['error'][:20]}",
+                '-', '-', '-'
+            ])
 
-    # 创建表格
-    table = Table(table_data, colWidths=[1.8*cm, 2.2*cm, 1.5*cm, 1.8*cm, 1.8*cm, 1.8*cm, 1.2*cm])
+    table = Table(table_data, colWidths=[2*cm, 2.5*cm, 1.8*cm, 1.8*cm, 1.5*cm])
     table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#667eea')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('FONTSIZE', (0, 1), (-1, -1), 8),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f3ff')])
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 1, colors.grey),
     ]))
-
     story.append(table)
-    story.append(Spacer(1, 0.5*cm))
 
-    # 生成时间
-    time_text = f'生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-    story.append(Paragraph(time_text, styles['Normal']))
-
-    # 构建 PDF
+    # 生成 PDF
     doc.build(story)
     pdf_buffer.seek(0)
 
@@ -567,27 +395,8 @@ def download_results(session_id):
         pdf_buffer,
         mimetype='application/pdf',
         as_attachment=True,
-        download_name=f'发票重命名结果_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
+        download_name=f'发票结果_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
     )
-
-
-def generate_list_text(results: list) -> str:
-    """生成重命名列表文本"""
-    text = "发票重命名列表\n"
-    text += "=" * 60 + "\n\n"
-
-    for item in results:
-        if item['status'] == 'success':
-            text += f"原文件名: {item['filename']}\n"
-            text += f"新文件名: {item['new_name']}\n"
-            text += f"开票日期: {item['data'].get('date', '-')}\n"
-            text += f"发票号码: {item['data'].get('invoice_number', '-')}\n"
-            text += f"购买方: {item['data'].get('buyer', '-')}\n"
-            text += f"销售方: {item['data'].get('supplier', '-')}\n"
-            text += f"金额: {item['data'].get('amount', '-')}\n"
-            text += "-" * 60 + "\n\n"
-
-    return text
 
 
 @app.errorhandler(413)
@@ -605,7 +414,7 @@ if __name__ == '__main__':
     print(f"访问地址: http://127.0.0.1:{port}")
     print(f"{'='*60}\n")
 
-    # 后台初始化 OCR（不阻塞启动）
+    # 后台初始化 OCR
     ocr_thread = threading.Thread(target=init_ocr_background, daemon=True)
     ocr_thread.start()
 
@@ -614,9 +423,6 @@ if __name__ == '__main__':
     except OSError as e:
         if "Address already in use" in str(e):
             print(f"\n❌ 错误: 端口 {port} 已被占用")
-            print(f"请尝试关闭占用此端口的程序或更改端口")
-            print(f"要更改端口，编辑此文件最后一行:")
-            print(f"  app.run(..., port=5001, ...)")
         else:
             print(f"\n❌ 启动失败: {e}")
     except KeyboardInterrupt:
