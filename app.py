@@ -99,7 +99,7 @@ class InvoiceExtractor:
             raise Exception(f"提取失败: {e}")
 
     def _extract_fields(self, text: str) -> dict:
-        """字段提取"""
+        """字段提取 - 改进版，优先用标签，备选用通用模式"""
         result = {
             "date": None,
             "invoice_number": None,
@@ -108,8 +108,8 @@ class InvoiceExtractor:
             "amount": None,
         }
 
-        # 日期
-        date_match = re.search(r'(\d{4})[\年\-/](\d{1,2})[\月\-/](\d{1,2})', text)
+        # === 日期 ===
+        date_match = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', text)
         if date_match:
             try:
                 y, m, d = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
@@ -118,38 +118,55 @@ class InvoiceExtractor:
             except:
                 pass
 
-        # 发票号
-        inv_match = re.search(r'(?:发票号|号码)[：\s]*(\d{6,20})', text)
+        # === 发票号 ===
+        # 优先找发票号标签
+        inv_match = re.search(r'(?:发票号|号码)[：\s]*(\d{15,20})', text)
         if inv_match:
             result["invoice_number"] = inv_match.group(1)
         else:
-            all_numbers = re.findall(r'\d{6,20}', text)
+            # 备选：找所有长数字（15-20位）
+            all_numbers = re.findall(r'\d{15,20}', text)
             if all_numbers:
                 result["invoice_number"] = all_numbers[0]
 
-        # 企业名
-        company_pattern = r'[\u4e00-\u9fa5]+(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心)'
-        companies = re.findall(company_pattern, text)
+        # === 购买方和销售方 ===
+        # 方式1：优先用标签方式
+        buyer_match = re.search(r'购买方[名称]*[：\s]*([^\n]+)', text)
+        if buyer_match:
+            result["buyer"] = buyer_match.group(1).strip()
 
-        seen = set()
-        unique_companies = []
-        for c in companies:
-            c = c.strip()
-            if 3 <= len(c) <= 100 and c not in seen:
-                if '统一' not in c and '税号' not in c and '社会' not in c:
-                    seen.add(c)
-                    unique_companies.append(c)
+        supplier_match = re.search(r'销售方[名称]*[：\s]*([^\n]+)', text)
+        if supplier_match:
+            result["supplier"] = supplier_match.group(1).strip()
 
-        if len(unique_companies) >= 2:
-            result["buyer"] = unique_companies[0]
-            result["supplier"] = unique_companies[1]
-        elif len(unique_companies) == 1:
-            result["buyer"] = unique_companies[0]
+        # 方式2：如果标签方式失败，用通用企业名识别
+        if not result["buyer"] or not result["supplier"]:
+            company_pattern = r'[\u4e00-\u9fa5]+(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心)'
+            companies = re.findall(company_pattern, text)
 
-        # 金额
+            seen = set()
+            unique_companies = []
+            for c in companies:
+                c = c.strip()
+                if 3 <= len(c) <= 100 and c not in seen:
+                    if '统一' not in c and '税号' not in c and '社会' not in c:
+                        seen.add(c)
+                        unique_companies.append(c)
+
+            if len(unique_companies) >= 2:
+                if not result["buyer"]:
+                    result["buyer"] = unique_companies[0]
+                if not result["supplier"]:
+                    result["supplier"] = unique_companies[1]
+            elif len(unique_companies) == 1:
+                if not result["buyer"]:
+                    result["buyer"] = unique_companies[0]
+
+        # === 金额 ===
+        # 优先级：标签 > 货币符号 > 元后缀
         amount_patterns = [
-            r'小写[）)]*\s*[¥￥垩圓]\s*([0-9]{1,10}\.[0-9]{2})',
-            r'[¥￥垩圓]\s*([0-9]{1,10}\.[0-9]{2})',
+            r'小写[）)]*\s*[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',
+            r'[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',
             r'([0-9]{1,10}\.[0-9]{2})\s*元',
         ]
 
