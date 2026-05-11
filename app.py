@@ -60,15 +60,13 @@ class InvoiceExtractor:
             raise Exception(f"图片读取失败: {e}")
 
     def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """图像预处理"""
+        """图像预处理 - 只做对比度增强，不做二值化（会导致OCR输出错误）"""
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(gray)
-            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            denoised = cv2.medianBlur(binary, 3)
-            result = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
-            return result
+            # 直接返回增强后的灰度图，不做二值化/降噪（会破坏OCR质量）
+            return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
         except:
             return image
 
@@ -127,20 +125,22 @@ class InvoiceExtractor:
                     pass
 
         # === 发票号 ===
-        # 方式1：查找标签（发票号码/号码） + 后面的数字（清理括号等干扰字符）
+        # 支持多种格式：纯数字、含字母（如 O 代替 0）、含括号等
         inv_patterns = [
-            r'(?:发票号|号码)[：\s]*([0-9\)\(]{10,})',  # 含括号的
-            r'(?:发票号|号码)[：\s]*(\d{15,20})',  # 纯数字
-            r'\d{15,20}',  # 任意15-20位数字
+            r'(?:发票号|号码)[：\s]*([A-Z0-9\)\(]{15,})',  # 发票号标签 + 字母数字
+            r'(?:发票号|号码)[：\s]*([0-9\)\(]{10,})',  # 发票号标签 + 纯数字（可能含括号）
+            r'[A-Z0-9]{15,}',  # 任意15+位字母数字
+            r'\d{15,20}',  # 任意15-20位纯数字
         ]
         for pattern in inv_patterns:
-            if '(' in pattern or ')' in pattern:
-                # 先匹配，再清理
+            if 'A-Z' in pattern or '(' in pattern or ')' in pattern:
+                # 先匹配，再清理非字母数字
                 match = re.search(pattern, text)
                 if match:
-                    raw = match.group(1) if '(' in pattern or ')' in pattern else match.group(0)
-                    clean = re.sub(r'[^\d]', '', raw)
-                    if 13 <= len(clean) <= 20:
+                    raw = match.group(1) if '(' in pattern else match.group(0)
+                    # 只保留字母和数字，去掉括号
+                    clean = re.sub(r'[^\dA-Z0-9]', '', raw)
+                    if 13 <= len(clean) <= 25:
                         result["invoice_number"] = clean
                         break
             else:
@@ -150,37 +150,44 @@ class InvoiceExtractor:
                     break
 
         # === 购买方和销售方 ===
-        # 方式1：优先用标签方式
-        buyer_match = re.search(r'购买方[名称]*[：\s]*([^\n：]{2,80})', text)
-        if buyer_match:
-            result["buyer"] = buyer_match.group(1).strip()
+        # OCR常见错误: 名称 → 1称/l称，购买方 → no match，销售方 → no match
+        # 策略: 提取所有"[某]称:"后面的企业名，然后按顺序分配
 
-        supplier_match = re.search(r'销售方[名称]*[：\s]*([^\n：]{2,80})', text)
-        if supplier_match:
-            result["supplier"] = supplier_match.group(1).strip()
+        # 找到所有 "1称:" 或 "l称:" 或 "名称:" 后面的内容
+        company_lines = []
 
-        # 方式2：如果标签方式失败，用通用企业名识别
-        if not result["buyer"] or not result["supplier"]:
+        # 匹配1称: ... 或 l称: ... 或 名称: ... 后面到行尾的内容
+        patterns_to_find_lines = [
+            r'[1l]称[：:]\s*([^\n]+)',  # 1称: 或 l称:
+            r'名称[：:]\s*([^\n]+)',     # 名称:
+        ]
+
+        for pattern in patterns_to_find_lines:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                company_lines.append(match.strip())
+
+        # 如果没找到标签形式，就用通用企业名识别
+        if not company_lines:
             company_pattern = r'[\u4e00-\u9fa5]+(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心)'
-            companies = re.findall(company_pattern, text)
+            company_lines = re.findall(company_pattern, text)
 
-            seen = set()
-            unique_companies = []
-            for c in companies:
-                c = c.strip()
-                if 3 <= len(c) <= 100 and c not in seen:
-                    if '统一' not in c and '税号' not in c and '社会' not in c:
-                        seen.add(c)
-                        unique_companies.append(c)
+        # 去重和过滤
+        seen = set()
+        unique_companies = []
+        for c in company_lines:
+            c = c.strip()
+            if 3 <= len(c) <= 100 and c not in seen:
+                if '统一' not in c and '税号' not in c and '社会' not in c and '代码' not in c:
+                    seen.add(c)
+                    unique_companies.append(c)
 
-            if len(unique_companies) >= 2:
-                if not result["buyer"]:
-                    result["buyer"] = unique_companies[0]
-                if not result["supplier"]:
-                    result["supplier"] = unique_companies[1]
-            elif len(unique_companies) == 1:
-                if not result["buyer"]:
-                    result["buyer"] = unique_companies[0]
+        # 按顺序分配购买方和销售方
+        if len(unique_companies) >= 2:
+            result["buyer"] = unique_companies[0]
+            result["supplier"] = unique_companies[1]
+        elif len(unique_companies) == 1:
+            result["buyer"] = unique_companies[0]
 
         # === 金额 ===
         # 方式1：优先找 "小写" 标签后的金额（最准确）
