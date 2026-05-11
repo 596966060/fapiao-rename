@@ -86,7 +86,12 @@ class InvoiceExtractor:
                 raise Exception("OCR 无法识别")
 
             text = '\n'.join(results)
-            return self._extract_fields(text)
+
+            # 提取字段
+            fields = self._extract_fields(text)
+            # 保存原始文本用于调试
+            fields['_raw_text'] = text
+            return fields
         except Exception as e:
             raise Exception(f"提取失败: {e}")
 

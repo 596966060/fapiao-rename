@@ -553,6 +553,7 @@
 
                 if (item.status === 'success') {
                     const data_obj = item.data || {};
+                    const rawText = data_obj._raw_text ? `<button style="margin-top: 10px; padding: 5px 10px; font-size: 12px; background: #667eea; color: white; border: none; border-radius: 4px; cursor: pointer;" onclick="alert('原始 OCR 文本:\\n\\n' + ${JSON.stringify(data_obj._raw_text)})">查看原始 OCR 文本</button>` : '';
                     div.innerHTML = `
                         <div class="file-name">📄 ${item.filename || 'Unknown'}</div>
                         <div class="file-new-name">✓ ${item.new_name || 'No name'}</div>
@@ -574,6 +575,7 @@
                             </div>
                         </div>
                         <span class="file-status success">✓ 识别成功</span>
+                        ${rawText}
                     `;
                 } else {
                     const errorMsg = item.error || 'Unknown error';
