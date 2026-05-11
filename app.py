@@ -82,6 +82,9 @@ class InvoiceExtractor:
             if image_array is None or image_array.size == 0:
                 raise Exception("无法读取图像")
 
+            # 图像预处理 - 提高 OCR 质量
+            image_array = self._preprocess_image(image_array)
+
             # OCR
             results = self.reader.readtext(image_array, detail=0)
             if not results:
@@ -96,8 +99,32 @@ class InvoiceExtractor:
         except Exception as e:
             raise Exception(f"提取失败: {e}")
 
+    def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """图像预处理 - 提高 OCR 质量"""
+        try:
+            # 1. 转灰度
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+            # 2. 自适应对比度增强（CLAHE）
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+
+            # 3. 二值化（自动阈值）
+            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # 4. 轻度去噪
+            denoised = cv2.medianBlur(binary, 3)
+
+            # 5. 转回 BGR 供 OCR 使用
+            result = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+
+            return result
+        except:
+            # 预处理失败，返回原始图像
+            return image
+
     def _extract_fields(self, text: str) -> dict:
-        """简化版字段提取 - 直接找企业名而不依赖标签"""
+        """字段提取 - 多层次回退策略"""
         result = {
             "date": None,
             "invoice_number": None,
@@ -106,78 +133,86 @@ class InvoiceExtractor:
             "amount": None,
         }
 
-        # 日期
-        match = re.search(r'(\d{4})[\年\-/](\d{1,2})[\月\-/](\d{1,2})', text)
-        if match:
+        # ===== 日期提取 =====
+        date_match = re.search(r'(\d{4})[\年\-/](\d{1,2})[\月\-/](\d{1,2})', text)
+        if date_match:
             try:
-                y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                y, m, d = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
                 if 1900 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
                     result["date"] = f"{y:04d}-{m:02d}-{d:02d}"
             except:
                 pass
 
-        # 发票号：找最长的数字串
-        numbers = re.findall(r'\d{6,20}', text)
-        if numbers:
-            result["invoice_number"] = numbers[0]
+        # ===== 发票号提取 =====
+        # 优先找标记为"发票号"的，否则找最长数字串
+        inv_match = re.search(r'(?:发票号|号码)[：\s]*(\d{6,20})', text)
+        if inv_match:
+            result["invoice_number"] = inv_match.group(1)
+        else:
+            all_numbers = re.findall(r'\d{6,20}', text)
+            if all_numbers:
+                result["invoice_number"] = all_numbers[0]
 
-        # 企业名提取：找所有包含"公司"、"有限"、"分公司"等关键字的文本
-        company_keywords = ['公司', '有限', '分公司', '集团', '股份', '企业', '研究所', '医院', '学校']
-        companies = []
+        # ===== 购买方和销售方提取 =====
+        # 策略：找所有企业名（包含"公司"、"有限"、"集团"等关键字）
+        company_pattern = r'[\u4e00-\u9fa5]+(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心|所|室|部|局|委|院)[\u4e00-\u9fa5]*'
+        companies = re.findall(company_pattern, text)
 
-        # 搜索包含企业关键字的行
-        for line in text.split('\n'):
-            line = line.strip()
-            if any(kw in line for kw in company_keywords):
-                # 提取该行中的企业名（去掉统一社会信用代码等前缀）
-                company = line
-                # 去掉统一社会信用代码等无关信息之前的部分
-                company = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5（）()，、]{20,}', '', company)
-                company = company.split('统一')[0].split('代码')[0].split('识别号')[0].strip()
-
-                if 3 <= len(company) <= 100:
-                    companies.append(company)
-
-        # 去重（保持顺序）
+        # 去重同时保留顺序
         seen = set()
         unique_companies = []
         for c in companies:
-            if c not in seen:
+            c = c.strip()
+            if len(c) >= 3 and c not in seen and '统一' not in c and '税号' not in c:
                 seen.add(c)
                 unique_companies.append(c)
 
-        companies = unique_companies[:2]  # 最多取两个
+        # 最多取前两个不同的企业名
+        if len(unique_companies) >= 2:
+            # 根据"购买方"和"销售方"的位置判断顺序
+            buyer_idx = text.find('购买')
+            supplier_idx = text.find('销售')
 
-        # 判断购买方和销售方
-        if len(companies) >= 2:
-            # 根据"购买方"和"销售方"关键词在文本中的位置判断顺序
-            buyer_pos = text.find('购买方')
-            supplier_pos = text.find('销售方')
+            # 如果都找不到，用"买"和"卖"
+            if buyer_idx == -1:
+                buyer_idx = text.find('买')
+            if supplier_idx == -1:
+                supplier_idx = text.find('卖')
 
-            if buyer_pos < supplier_pos:  # 购买方在前，销售方在后
-                result["buyer"] = companies[0]
-                result["supplier"] = companies[1]
-            else:  # 销售方在前，购买方在后
-                result["supplier"] = companies[0]
-                result["buyer"] = companies[1]
-        elif len(companies) == 1:
-            result["buyer"] = companies[0]
-
-        # 金额：处理各种OCR误识（¥、￥、垩 等）
-        # 先找"小写"后的金额
-        match = re.search(r'小写[）)]*\s*[¥￥垩\s]*([0-9]{1,10}\.[0-9]{2})', text)
-        if match:
-            result["amount"] = match.group(1)
-        else:
-            # 再找任何"¥"或"￥"或"垩"后的金额
-            matches = re.findall(r'[¥￥垩]\s*([0-9]{1,10}\.[0-9]{2})', text)
-            if matches:
-                result["amount"] = str(max(float(m) for m in matches))
+            if buyer_idx >= 0 and supplier_idx >= 0:
+                if buyer_idx < supplier_idx:
+                    result["buyer"] = unique_companies[0]
+                    result["supplier"] = unique_companies[1]
+                else:
+                    result["supplier"] = unique_companies[0]
+                    result["buyer"] = unique_companies[1]
             else:
-                # 最后找"元"后缀的金额
-                matches = re.findall(r'([0-9]{1,10}\.[0-9]{2})\s*元', text)
-                if matches:
+                # 如果找不到标记，就按顺序
+                result["buyer"] = unique_companies[0]
+                if len(unique_companies) > 1:
+                    result["supplier"] = unique_companies[1]
+
+        elif len(unique_companies) == 1:
+            result["buyer"] = unique_companies[0]
+
+        # ===== 金额提取 =====
+        # 处理各种OCR误识的符号：¥、￥、垩、圓等
+        amount_patterns = [
+            r'小写[）)]*\s*[¥￥垩圓]\s*([0-9]{1,10}\.[0-9]{2})',  # 标明"小写"的最优先
+            r'[¥￥垩圓]\s*([0-9]{1,10}\.[0-9]{2})',  # 任何货币符号
+            r'([0-9]{1,10}\.[0-9]{2})\s*元',  # "元"后缀
+            r'合.*计.*[¥￥垩圓]?\s*([0-9]{1,10}\.[0-9]{2})',  # "合计"附近
+        ]
+
+        for pattern in amount_patterns:
+            matches = re.findall(pattern, text)
+            if matches:
+                try:
+                    # 取最大金额（通常是总额）
                     result["amount"] = str(max(float(m) for m in matches))
+                    break
+                except:
+                    pass
 
         return result
 
