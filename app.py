@@ -115,54 +115,37 @@ class InvoiceExtractor:
             except:
                 pass
 
-        # 发票号
+        # 发票号 - 多个模式
         for pattern in [r'发票(?:代)?号[码]*[：:\s]*([0-9]{6,20})',
-                        r'编号[：\s]*([0-9]{6,20})',
-                        r'([0-9]{6,20})']:
+                        r'编号[：:\s]*([0-9]{6,20})',
+                        r'发票号码[：:\s]*([0-9]{6,20})',
+                        r'([0-9]{15,20})']:
             match = re.search(pattern, text)
             if match and 6 <= len(match.group(1)) <= 20:
                 result["invoice_number"] = match.group(1)
                 break
 
-        # 销售方和购买方 - 改进版本
-        lines = text.split('\n')
+        # 购买方 - 使用"购买方信息"标签
+        match = re.search(r'购买方信息[：:\s]*([^\n]+?)(?:税号|统一|纳税|$)', text)
+        if match:
+            buyer = match.group(1).strip()
+            # 过滤掉太短或不合理的
+            if len(buyer) > 2 and buyer not in ['信息', '-', '']:
+                result["buyer"] = buyer[:80]
 
-        for line in lines:
-            line_stripped = line.strip()
+        # 销售方 - 使用"销售方信息"标签
+        match = re.search(r'销售方信息[：:\s]*([^\n]+?)(?:税号|统一|纳税|$)', text)
+        if match:
+            supplier = match.group(1).strip()
+            if len(supplier) > 2 and supplier not in ['信息', '-', '']:
+                result["supplier"] = supplier[:80]
 
-            # 销售方 - 多种标签格式
-            if re.search(r'销售方|卖方|供应商|出票人', line_stripped):
-                # 尝试多种分隔符
-                for sep in [r'[：:]', r'[\s]*', r'$']:
-                    match = re.search(rf'(?:销售方|卖方|供应商|出票人){sep}\s*([^\n：]{2,80})', line_stripped)
-                    if match:
-                        name = match.group(1).strip()
-                        # 过滤掉过短或明显不是公司名的
-                        if len(name) > 1 and not name.startswith('税'):
-                            result["supplier"] = name
-                            break
-                if result["supplier"]:
-                    break
-
-            # 购买方 - 多种标签格式
-            if re.search(r'购买方|买方|采购方|收票人', line_stripped):
-                for sep in [r'[：:]', r'[\s]*', r'$']:
-                    match = re.search(rf'(?:购买方|买方|采购方|收票人){sep}\s*([^\n：]{2,80})', line_stripped)
-                    if match:
-                        name = match.group(1).strip()
-                        if len(name) > 1 and not name.startswith('税'):
-                            result["buyer"] = name
-                            break
-                if result["buyer"]:
-                    break
-
-        # 金额 - 改进版本
-        # 优先匹配"合计"、"价税合计"
-        for pattern in [r'(?:价税)?合计[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'合:\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'小计[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'[¥￥]\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'([0-9]{1,10}\.[0-9]{2})元']:
+        # 金额 - 优先"价税合计"
+        for pattern in [r'价税合计[（(]小写[）)][：:\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+                        r'价税合计[：:\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+                        r'合计[（(]小写[）)][：:\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+                        r'合计[：:\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+                        r'[¥￥]\s*([0-9]{1,10}\.[0-9]{2})元?']:
             matches = re.findall(pattern, text)
             if matches:
                 try:
