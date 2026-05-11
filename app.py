@@ -34,7 +34,12 @@ if sys.platform == 'win32':
 import easyocr
 import cv2
 import numpy as np
-import fitz
+
+# 兼容 PyMuPDF 导入
+try:
+    import fitz
+except ImportError:
+    import pymupdf as fitz
 
 # ======================== 发票提取 ========================
 
@@ -46,9 +51,21 @@ class InvoiceExtractor:
 
     def _pdf_to_image(self, pdf_path: str) -> np.ndarray:
         try:
-            doc = fitz.open(pdf_path)
+            # 使用 fitz.open() 打开 PDF
+            try:
+                doc = fitz.open(pdf_path)
+            except AttributeError:
+                # 备选：使用绝对路径的 open
+                import pymupdf
+                doc = pymupdf.open(pdf_path)
+
+            if len(doc) == 0:
+                raise Exception("PDF 没有页面")
+
             page = doc[0]
-            pix = page.get_pixmap(matrix=fitz.Matrix(0.75, 0.75))
+            # 提高分辨率以获得更好的 OCR 效果
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+
             image_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
                 pix.height, pix.width, pix.n
             )
@@ -56,6 +73,7 @@ class InvoiceExtractor:
                 image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
             elif pix.n == 4:
                 image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
+
             doc.close()
             return image_array
         except Exception as e:
@@ -125,40 +143,64 @@ class InvoiceExtractor:
             except:
                 pass
 
-        # 发票号 - 多个模式
-        for pattern in [r'发票(?:代)?号[码]*[：:\s]*([0-9]{6,20})',
-                        r'编号[：:\s]*([0-9]{6,20})',
-                        r'发票号码[：:\s]*([0-9]{6,20})',
-                        r'([0-9]{15,20})']:
-            match = re.search(pattern, text)
-            if match and 6 <= len(match.group(1)) <= 20:
-                result["invoice_number"] = match.group(1)
-                break
+        # 发票号 - 寻找长数字序列
+        matches = re.findall(r'\b\d{6,20}\b', text)
+        if matches:
+            for m in matches:
+                if 6 <= len(m) <= 20:
+                    result["invoice_number"] = m
+                    break
 
-        # 购买方 - 使用"购买方信息"标签
-        match = re.search(r'购买方信息[：:\s]*([^\n]+?)(?:税号|统一|纳税|$)', text)
+        # 购买方 - 多种方式查找
+        # 方式 1: 使用"购买方信息"标签
+        match = re.search(r'购买方信息[：\s]*(.{2,100}?)(?=统一|税号|纳税|销售|名称|$)', text, re.DOTALL)
         if match:
             buyer = match.group(1).strip()
-            # 过滤掉太短或不合理的
-            if len(buyer) > 2 and buyer not in ['信息', '-', '']:
-                result["buyer"] = buyer[:80]
+            buyer = re.sub(r'[\n\s]+', '', buyer)  # 去除换行和多余空格
+            if 3 <= len(buyer) <= 100:
+                result["buyer"] = buyer
 
-        # 销售方 - 使用"销售方信息"标签
-        match = re.search(r'销售方信息[：:\s]*([^\n]+?)(?:税号|统一|纳税|$)', text)
+        # 方式 2: 直接查找"购买方"
+        if not result["buyer"]:
+            match = re.search(r'(?:购买方|买方)[：\s]*(.{2,100}?)(?=[\n统一税号销售名称]|$)', text)
+            if match:
+                buyer = match.group(1).strip()
+                buyer = re.sub(r'[\n\s]+', '', buyer)
+                if 3 <= len(buyer) <= 100:
+                    result["buyer"] = buyer
+
+        # 销售方 - 多种方式查找
+        # 方式 1: 使用"销售方信息"标签
+        match = re.search(r'销售方信息[：\s]*(.{2,100}?)(?=统一|税号|纳税|购买|名称|$)', text, re.DOTALL)
         if match:
             supplier = match.group(1).strip()
-            if len(supplier) > 2 and supplier not in ['信息', '-', '']:
-                result["supplier"] = supplier[:80]
+            supplier = re.sub(r'[\n\s]+', '', supplier)
+            if 3 <= len(supplier) <= 100:
+                result["supplier"] = supplier
 
-        # 金额 - 优先"价税合计"
-        for pattern in [r'价税合计[（(]小写[）)][：:\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'价税合计[：:\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'合计[（(]小写[）)][：:\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'合计[：:\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
-                        r'[¥￥]\s*([0-9]{1,10}\.[0-9]{2})元?']:
+        # 方式 2: 直接查找"销售方"
+        if not result["supplier"]:
+            match = re.search(r'(?:销售方|卖方)[：\s]*(.{2,100}?)(?=[\n统一税号购买名称]|$)', text)
+            if match:
+                supplier = match.group(1).strip()
+                supplier = re.sub(r'[\n\s]+', '', supplier)
+                if 3 <= len(supplier) <= 100:
+                    result["supplier"] = supplier
+
+        # 金额 - 多个模式
+        amount_patterns = [
+            r'价税合计[（(]?小写[）)]?[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+            r'(?:价税)?合计[（(]?小写[）)]?[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+            r'合计[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+            r'[¥￥]\s*([0-9]{1,10}\.[0-9]{2})',
+            r'([0-9]{1,10}\.[0-9]{2})\s*元',
+        ]
+
+        for pattern in amount_patterns:
             matches = re.findall(pattern, text)
             if matches:
                 try:
+                    # 取最大的金额（通常是总额）
                     result["amount"] = str(max(float(m) for m in matches))
                     break
                 except:
