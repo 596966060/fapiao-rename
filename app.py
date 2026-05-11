@@ -109,33 +109,53 @@ class InvoiceExtractor:
         }
 
         # === 日期 ===
-        date_match = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', text)
-        if date_match:
-            try:
-                y, m, d = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
-                if 1900 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
-                    result["date"] = f"{y:04d}-{m:02d}-{d:02d}"
-            except:
-                pass
+        # 支持多种格式：2026年05月01日 / 202605月01 / 2026-05-01 等
+        date_patterns = [
+            r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})',  # 标准：2026年05月01日
+            r'(\d{4})[年\-/]?\s*(\d{1,2})[月\-/]?\s*(\d{1,2})',  # 变体
+            r'(\d{4})(\d{2})(\d{2})',  # 紧凑：20260501
+        ]
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                    if 1900 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
+                        result["date"] = f"{y:04d}-{m:02d}-{d:02d}"
+                        break
+                except:
+                    pass
 
         # === 发票号 ===
-        # 优先找发票号标签
-        inv_match = re.search(r'(?:发票号|号码)[：\s]*(\d{15,20})', text)
-        if inv_match:
-            result["invoice_number"] = inv_match.group(1)
-        else:
-            # 备选：找所有长数字（15-20位）
-            all_numbers = re.findall(r'\d{15,20}', text)
-            if all_numbers:
-                result["invoice_number"] = all_numbers[0]
+        # 方式1：查找标签（发票号码/号码） + 后面的数字（清理括号等干扰字符）
+        inv_patterns = [
+            r'(?:发票号|号码)[：\s]*([0-9\)\(]{10,})',  # 含括号的
+            r'(?:发票号|号码)[：\s]*(\d{15,20})',  # 纯数字
+            r'\d{15,20}',  # 任意15-20位数字
+        ]
+        for pattern in inv_patterns:
+            if '(' in pattern or ')' in pattern:
+                # 先匹配，再清理
+                match = re.search(pattern, text)
+                if match:
+                    raw = match.group(1) if '(' in pattern or ')' in pattern else match.group(0)
+                    clean = re.sub(r'[^\d]', '', raw)
+                    if 13 <= len(clean) <= 20:
+                        result["invoice_number"] = clean
+                        break
+            else:
+                matches = re.findall(pattern, text)
+                if matches:
+                    result["invoice_number"] = matches[0]
+                    break
 
         # === 购买方和销售方 ===
         # 方式1：优先用标签方式
-        buyer_match = re.search(r'购买方[名称]*[：\s]*([^\n]+)', text)
+        buyer_match = re.search(r'购买方[名称]*[：\s]*([^\n：]{2,80})', text)
         if buyer_match:
             result["buyer"] = buyer_match.group(1).strip()
 
-        supplier_match = re.search(r'销售方[名称]*[：\s]*([^\n]+)', text)
+        supplier_match = re.search(r'销售方[名称]*[：\s]*([^\n：]{2,80})', text)
         if supplier_match:
             result["supplier"] = supplier_match.group(1).strip()
 
@@ -163,11 +183,14 @@ class InvoiceExtractor:
                     result["buyer"] = unique_companies[0]
 
         # === 金额 ===
-        # 优先级：标签 > 货币符号 > 元后缀
+        # 方式1：优先找 "小写" 标签后的金额（最准确）
+        # 方式2：货币符号后的金额
+        # 方式3：元后缀
         amount_patterns = [
             r'小写[）)]*\s*[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',
             r'[¥￥垩圓Y]\s*([0-9]{1,10}\.[0-9]{2})',
             r'([0-9]{1,10}\.[0-9]{2})\s*元',
+            r'合[計计]\s*[¥￥垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',  # 合计行
         ]
 
         for pattern in amount_patterns:
