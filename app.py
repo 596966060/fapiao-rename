@@ -167,56 +167,66 @@ class InvoiceExtractor:
                     result["invoice_number"] = m
                     break
 
-        # 购买方 - 多种方式查找
-        # 方式 1: 使用"购买方信息"标签
-        match = re.search(r'购买方信息[：\s]*(.{2,100}?)(?=统一|税号|纳税|销售|名称|$)', text, re.DOTALL)
-        if match:
-            buyer = match.group(1).strip()
-            buyer = re.sub(r'[\n\s]+', '', buyer)  # 去除换行和多余空格
-            if 3 <= len(buyer) <= 100:
-                result["buyer"] = buyer
+        # 将文本分行处理
+        lines = text.split('\n')
 
-        # 方式 2: 直接查找"购买方"
-        if not result["buyer"]:
-            match = re.search(r'(?:购买方|买方)[：\s]*(.{2,100}?)(?=[\n统一税号销售名称]|$)', text)
-            if match:
+        # 购买方 - 多种方式
+        for i, line in enumerate(lines):
+            # 方式 1: 找 "购买方" 开头的行
+            if '购买方' in line:
+                # 查看下面几行找公司名
+                for j in range(i, min(i+3, len(lines))):
+                    next_line = lines[j].strip()
+                    if '名称' in next_line or ('：' in next_line and len(next_line) > 10):
+                        match = re.search(r'[名称]*[：:]\s*(.{2,100}?)(?=$|[\n统一税号])', next_line)
+                        if match:
+                            buyer = match.group(1).strip()
+                            buyer = re.sub(r'[\n\s]+', '', buyer)
+                            if 3 <= len(buyer) <= 100 and '统一' not in buyer and '税号' not in buyer:
+                                result["buyer"] = buyer
+                                break
+
+            # 方式 2: "购买方信息" 标签在同一行
+            match = re.search(r'购买方信息[：\s]*(.{2,100}?)(?=$|[\n统一税号])', line)
+            if match and not result["buyer"]:
                 buyer = match.group(1).strip()
                 buyer = re.sub(r'[\n\s]+', '', buyer)
                 if 3 <= len(buyer) <= 100:
                     result["buyer"] = buyer
 
-        # 销售方 - 多种方式查找
-        # 方式 1: 使用"销售方信息"标签
-        match = re.search(r'销售方信息[：\s]*(.{2,100}?)(?=统一|税号|纳税|购买|名称|$)', text, re.DOTALL)
-        if match:
-            supplier = match.group(1).strip()
-            supplier = re.sub(r'[\n\s]+', '', supplier)
-            if 3 <= len(supplier) <= 100:
-                result["supplier"] = supplier
+        # 销售方 - 多种方式
+        for i, line in enumerate(lines):
+            # 方式 1: 找 "销售方" 开头的行
+            if '销售方' in line:
+                for j in range(i, min(i+3, len(lines))):
+                    next_line = lines[j].strip()
+                    if '名称' in next_line or ('：' in next_line and len(next_line) > 10):
+                        match = re.search(r'[名称]*[：:]\s*(.{2,100}?)(?=$|[\n统一税号])', next_line)
+                        if match:
+                            supplier = match.group(1).strip()
+                            supplier = re.sub(r'[\n\s]+', '', supplier)
+                            if 3 <= len(supplier) <= 100 and '统一' not in supplier and '税号' not in supplier:
+                                result["supplier"] = supplier
+                                break
 
-        # 方式 2: 直接查找"销售方"
-        if not result["supplier"]:
-            match = re.search(r'(?:销售方|卖方)[：\s]*(.{2,100}?)(?=[\n统一税号购买名称]|$)', text)
-            if match:
+            # 方式 2: "销售方信息" 标签在同一行
+            match = re.search(r'销售方信息[：\s]*(.{2,100}?)(?=$|[\n统一税号])', line)
+            if match and not result["supplier"]:
                 supplier = match.group(1).strip()
                 supplier = re.sub(r'[\n\s]+', '', supplier)
                 if 3 <= len(supplier) <= 100:
                     result["supplier"] = supplier
 
-        # 金额 - 多个模式
-        amount_patterns = [
-            r'价税合计[（(]?小写[）)]?[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
-            r'(?:价税)?合计[（(]?小写[）)]?[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
-            r'合计[：\s]*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+        # 金额 - 优先级很高的模式
+        for pattern in [
+            r'价税合计[（(]小写[）)]?\s*[：:]\s*[¥￥]?\s*([0-9]{1,10}\.[0-9]{2})',
+            r'小写\s*[¥￥]\s*([0-9]{1,10}\.[0-9]{2})',
             r'[¥￥]\s*([0-9]{1,10}\.[0-9]{2})',
             r'([0-9]{1,10}\.[0-9]{2})\s*元',
-        ]
-
-        for pattern in amount_patterns:
+        ]:
             matches = re.findall(pattern, text)
             if matches:
                 try:
-                    # 取最大的金额（通常是总额）
                     result["amount"] = str(max(float(m) for m in matches))
                     break
                 except:
