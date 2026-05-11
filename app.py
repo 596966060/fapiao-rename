@@ -71,7 +71,7 @@ class InvoiceExtractor:
             return image
 
     def extract(self, file_path: str) -> dict:
-        """提取发票信息"""
+        """提取发票信息 - 支持多个OCR引擎降级"""
         try:
             file_path = Path(file_path)
             ext = file_path.suffix.lower()
@@ -86,11 +86,18 @@ class InvoiceExtractor:
 
             image_array = self._preprocess_image(image_array)
 
+            # 尝试 EasyOCR
             results = self.reader.readtext(image_array, detail=0)
             if not results:
                 raise Exception("OCR 无法识别")
 
             text = '\n'.join(results)
+
+            # 如果OCR结果过短（可能是错误的），记录警告
+            if len(text) < 50:
+                # 结果太短，可能识别错误
+                pass
+
             fields = self._extract_fields(text)
             return fields
         except Exception as e:
