@@ -513,8 +513,16 @@
                 method: 'POST',
                 body: formData
             })
-            .then(r => r.json())
-            .then(data => {
+            .then(r => {
+                const contentType = r.headers.get('content-type') || '';
+                if (!contentType.includes('application/json')) {
+                    return r.text().then(t => {
+                        throw new Error(`服务器错误 (${r.status})：${t.slice(0, 120) || '无响应内容'}`);
+                    });
+                }
+                return r.json().then(data => ({ data, status: r.status }));
+            })
+            .then(({ data, status }) => {
                 if (data.error) {
                     showStatus(`❌ ${data.error}`, 'error');
                 } else if (!data.session_id || !data.results) {

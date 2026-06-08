@@ -379,7 +379,8 @@ def upload_file():
                 })
                 continue
 
-            temp_path = os.path.join(tempfile.gettempdir(), file.filename)
+            safe_name = re.sub(r'[^\w.\-]', '_', file.filename)
+            temp_path = os.path.join(tempfile.gettempdir(), f"{session_id}_{safe_name}")
             file.save(temp_path)
 
             try:
@@ -506,6 +507,18 @@ def download_results(session_id):
 @app.errorhandler(413)
 def file_too_large(e):
     return jsonify({'error': '文件过大，最大支持 500MB'}), 413
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    print(f"未处理异常: {traceback.format_exc()}")
+    return jsonify({'error': f'服务器内部错误: {str(e)}'}), 500
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': '服务器内部错误，请重试'}), 500
 
 
 if __name__ == '__main__':
