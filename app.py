@@ -71,6 +71,29 @@ class InvoiceExtractor:
         except:
             return image
 
+    def _extract_from_filename(self, stem: str) -> dict:
+        """从文件名中提取发票信息作为补充（当OCR识别不全时使用）
+        常见格式: dzfp_263220000004482288706_上海松鼠创科技术有限责任公司_20260604112321
+        """
+        result = {}
+        parts = stem.split('_')
+
+        for part in parts:
+            # 提取发票号：15-25位纯数字
+            if re.match(r'^\d{15,25}$', part):
+                result.setdefault('invoice_number', part)
+            # 提取日期：8位紧凑格式 20260604，严格月日校验
+            elif re.match(r'^20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d*$', part):
+                date_str = part[:8]
+                y, m, d = int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8])
+                if 1 <= m <= 12 and 1 <= d <= 31:
+                    result.setdefault('date', f"{y:04d}-{m:02d}-{d:02d}")
+            # 提取公司名：包含中文且带有企业词尾
+            elif re.search(r'[\u4e00-\u9fa5]', part) and len(part) >= 4:
+                result.setdefault('buyer', part)
+
+        return result
+
     def extract(self, file_path: str) -> dict:
         """提取发票信息 - 支持多个OCR引擎降级"""
         try:
@@ -94,12 +117,14 @@ class InvoiceExtractor:
 
             text = '\n'.join(results)
 
-            # 如果OCR结果过短（可能是错误的），记录警告
-            if len(text) < 50:
-                # 结果太短，可能识别错误
-                pass
-
             fields = self._extract_fields(text)
+
+            # 如果关键字段缺失，尝试从文件名补充
+            filename_fields = self._extract_from_filename(file_path.stem)
+            for key in ('date', 'invoice_number', 'buyer', 'supplier'):
+                if not fields.get(key) and filename_fields.get(key):
+                    fields[key] = filename_fields[key]
+
             return fields
         except Exception as e:
             raise Exception(f"提取失败: {e}")
@@ -115,17 +140,25 @@ class InvoiceExtractor:
         }
 
         # === 日期 ===
-        # 支持多种格式：2026年05月01日 / 202605月01 / 2026-05-01 等
+        # 优先匹配有明确标签的日期，再匹配年月日格式，最后才用紧凑数字（严格校验避免误匹配发票号）
         date_patterns = [
-            r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})',  # 标准：2026年05月01日
-            r'(\d{4})[年\-/]?\s*(\d{1,2})[月\-/]?\s*(\d{1,2})',  # 变体
-            r'(\d{4})(\d{2})(\d{2})',  # 紧凑：20260501
+            # 有标签：开票日期 / 日期 后面跟年月日
+            (r'(?:开票日期|日期)[：:\s]*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', 1, 2, 3),
+            # 标准年月日
+            (r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', 1, 2, 3),
+            # 分隔符格式 2026-06-04 / 2026/06/04
+            (r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', 1, 2, 3),
+            # 紧凑格式：严格要求月份01-12，日期01-31，且前后不是数字（避免匹配发票号）
+            (r'(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)', 1, 2, 3),
         ]
-        for pattern in date_patterns:
+        for entry in date_patterns:
+            pattern, gi, gm, gd = entry
             match = re.search(pattern, text)
             if match:
                 try:
-                    y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                    y = int(match.group(gi))
+                    m = int(match.group(gm))
+                    d = int(match.group(gd))
                     if 1900 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
                         result["date"] = f"{y:04d}-{m:02d}-{d:02d}"
                         break
@@ -138,15 +171,13 @@ class InvoiceExtractor:
             r'(?:发票号|号码)[：\s]*([A-Z0-9\)\(]{15,})',  # 发票号标签 + 字母数字
             r'(?:发票号|号码)[：\s]*([0-9\)\(]{10,})',  # 发票号标签 + 纯数字（可能含括号）
             r'[A-Z0-9]{15,}',  # 任意15+位字母数字
-            r'\d{15,20}',  # 任意15-20位纯数字
+            r'\d{15,25}',  # 任意15-25位纯数字（支持更长的全电发票号）
         ]
         for pattern in inv_patterns:
             if 'A-Z' in pattern or '(' in pattern or ')' in pattern:
-                # 先匹配，再清理非字母数字
                 match = re.search(pattern, text)
                 if match:
                     raw = match.group(1) if '(' in pattern else match.group(0)
-                    # 只保留字母和数字，去掉括号
                     clean = re.sub(r'[^\dA-Z0-9]', '', raw)
                     if 13 <= len(clean) <= 25:
                         result["invoice_number"] = clean
@@ -158,44 +189,64 @@ class InvoiceExtractor:
                     break
 
         # === 购买方和销售方 ===
-        # OCR常见错误: 名称 → 1称/l称，购买方 → no match，销售方 → no match
-        # 策略: 提取所有"[某]称:"后面的企业名，然后按顺序分配
+        # 策略1: 明确的购买方/销售方标签
+        buyer_match = re.search(
+            r'(?:购买方|购\s*方|买\s*方)[^\n]*?(?:[1l名]称|称)[：:]\s*([^\n]+)', text)
+        supplier_match = re.search(
+            r'(?:销售方|销\s*方|卖\s*方)[^\n]*?(?:[1l名]称|称)[：:]\s*([^\n]+)', text)
 
-        # 找到所有 "1称:" 或 "l称:" 或 "名称:" 后面的内容
-        company_lines = []
+        def clean_company(name):
+            """清理公司名，要求包含中文字符"""
+            name = name.strip()
+            # 去掉税号、数字串等杂质
+            name = re.sub(r'\s+\d{10,}.*$', '', name)
+            name = name.strip()
+            # 必须包含中文字符才算有效公司名
+            if not re.search(r'[\u4e00-\u9fa5]', name):
+                return None
+            if len(name) < 3 or len(name) > 60:
+                return None
+            return name
 
-        # 匹配1称: ... 或 l称: ... 或 名称: ... 后面到行尾的内容
-        patterns_to_find_lines = [
-            r'[1l]称[：:]\s*([^\n]+)',  # 1称: 或 l称:
-            r'名称[：:]\s*([^\n]+)',     # 名称:
-        ]
+        if buyer_match:
+            result["buyer"] = clean_company(buyer_match.group(1))
+        if supplier_match:
+            result["supplier"] = clean_company(supplier_match.group(1))
 
-        for pattern in patterns_to_find_lines:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                company_lines.append(match.strip())
+        # 策略2: 如果明确标签没找到，找所有 "名称:" / "1称:" / "l称:" 后面的内容
+        if not result["buyer"] and not result["supplier"]:
+            company_lines = []
+            label_patterns = [
+                r'[1l]称[：:]\s*([^\n]+)',
+                r'名称[：:]\s*([^\n]+)',
+            ]
+            for pattern in label_patterns:
+                for m in re.findall(pattern, text):
+                    c = clean_company(m)
+                    if c:
+                        company_lines.append(c)
 
-        # 如果没找到标签形式，就用通用企业名识别
-        if not company_lines:
-            company_pattern = r'[\u4e00-\u9fa5]+(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心)'
-            company_lines = re.findall(company_pattern, text)
+            # 策略3: 通用企业名识别（要求包含中文 + 企业词尾）
+            if not company_lines:
+                company_pattern = r'[\u4e00-\u9fa5]{2,}(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心)'
+                for m in re.findall(company_pattern, text):
+                    c = clean_company(m)
+                    if c:
+                        company_lines.append(c)
 
-        # 去重和过滤
-        seen = set()
-        unique_companies = []
-        for c in company_lines:
-            c = c.strip()
-            if 3 <= len(c) <= 100 and c not in seen:
-                if '统一' not in c and '税号' not in c and '社会' not in c and '代码' not in c:
+            # 去重
+            seen = set()
+            unique_companies = []
+            for c in company_lines:
+                if c not in seen:
                     seen.add(c)
                     unique_companies.append(c)
 
-        # 按顺序分配购买方和销售方
-        if len(unique_companies) >= 2:
-            result["buyer"] = unique_companies[0]
-            result["supplier"] = unique_companies[1]
-        elif len(unique_companies) == 1:
-            result["buyer"] = unique_companies[0]
+            if len(unique_companies) >= 2:
+                result["buyer"] = unique_companies[0]
+                result["supplier"] = unique_companies[1]
+            elif len(unique_companies) == 1:
+                result["buyer"] = unique_companies[0]
 
         # === 金额 ===
         # 关键：优先找"价税合计(小写)" - 这是最终价格！
