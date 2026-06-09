@@ -282,31 +282,52 @@ class InvoiceExtractor:
         ]
         result["amount"] = _find_amount(total_patterns, text)
 
-        # === 合计行：同时捕获不含税金额 + 税额 ===
-        # 典型格式：合计  ¥232.57  ¥33.74  （金额在左，税额在右，同一行）
-        amtpat = r'[¥￥垒垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})'
-        two_num = re.search(
-            r'合计\s*' + amtpat + r'\s*' + amtpat, text)
+        # === 合计金额（不含税）+ 税额 ===
+        # OCR 经常丢失¥符号或将其误读为"半/垩/垒"，也经常拆散表格行。
+        # 最可靠的方法：找所有小数，找两个加起来约等于价税合计的组合。
+
+        # 策略1：标签直接匹配（有标签时最精准）
+        amtpat = r'[¥￥垒垩圓Y半]?\s*([0-9]{1,10}\.[0-9]{2})'
+        # 合计行两列同行
+        two_num = re.search(r'合计\s*' + amtpat + r'[\s\n]+' + amtpat, text)
         if two_num:
             result["tax_free_amount"] = f"{float(two_num.group(1)):.2f}"
             result["tax_amount"]      = f"{float(two_num.group(2)):.2f}"
         else:
-            # OCR 可能将合计行拆成多行，逐列尝试
-            # 不含税金额：合计 / 金额 标签附近的第一个小数
-            tax_free_patterns = [
-                r'合计\s*' + amtpat,
-                r'(?:不含税|金额)[：:\s]*' + amtpat,
-            ]
-            result["tax_free_amount"] = _find_amount(tax_free_patterns, text)
+            # 带税额标签
+            m = re.search(r'(?:合计税额|税\s*额)[：:\s]*' + amtpat, text)
+            if m:
+                result["tax_amount"] = f"{float(m.group(1)):.2f}"
+            m = re.search(r'(?:不含税|合计金额)[：:\s]*' + amtpat, text)
+            if m:
+                result["tax_free_amount"] = f"{float(m.group(1)):.2f}"
 
-            # 税额：明确带"税额"标签
-            tax_patterns = [
-                r'(?:合计税额|税\s*额)[：:\s]*' + amtpat,
-                r'税\s*额[^0-9\n]{0,10}([0-9]{1,10}\.[0-9]{2})',
-            ]
-            result["tax_amount"] = _find_amount(tax_patterns, text)
+        # 策略2：若标签匹配失败，用"配对加法"推断
+        # 找所有小数（排除价税合计本身），看哪两个之和约等于总金额
+        if result["amount"] and (not result["tax_free_amount"] or not result["tax_amount"]):
+            try:
+                total = float(result["amount"])
+                # 提取文本中所有 x.xx 格式小数，去掉和总价相同的
+                candidates = list(dict.fromkeys(
+                    float(m) for m in re.findall(r'\b(\d{1,8}\.\d{2})\b', text)
+                    if abs(float(m) - total) > 0.01 and float(m) > 0
+                ))
+                found = False
+                for i, a in enumerate(candidates):
+                    for b in candidates[i+1:]:
+                        if abs(a + b - total) <= 0.05:   # 允许0.05元的舍入误差
+                            bigger  = max(a, b)
+                            smaller = min(a, b)
+                            result["tax_free_amount"] = f"{bigger:.2f}"
+                            result["tax_amount"]      = f"{smaller:.2f}"
+                            found = True
+                            break
+                    if found:
+                        break
+            except:
+                pass
 
-        # 兜底推算：有价税合计 + 不含税金额 → 推出税额
+        # 策略3：只知道其中一个，推算另一个
         if result["amount"] and result["tax_free_amount"] and not result["tax_amount"]:
             try:
                 tax = round(float(result["amount"]) - float(result["tax_free_amount"]), 2)
@@ -314,8 +335,6 @@ class InvoiceExtractor:
                     result["tax_amount"] = f"{tax:.2f}"
             except:
                 pass
-
-        # 兜底推算：有价税合计 + 税额 → 推出不含税金额
         if result["amount"] and result["tax_amount"] and not result["tax_free_amount"]:
             try:
                 base = round(float(result["amount"]) - float(result["tax_amount"]), 2)
