@@ -136,7 +136,9 @@ class InvoiceExtractor:
             "invoice_number": None,
             "buyer": None,
             "supplier": None,
-            "amount": None,
+            "amount": None,        # 价税合计
+            "tax_free_amount": None,  # 合计金额（不含税）
+            "tax_amount": None,    # 合计税额
         }
 
         # === 日期 ===
@@ -248,44 +250,59 @@ class InvoiceExtractor:
             elif len(unique_companies) == 1:
                 result["buyer"] = unique_companies[0]
 
-        # === 金额 ===
-        # 关键：优先找"价税合计(小写)" - 这是最终价格！
-        # OCR可能把字符识别错（如¥识别为垩/垒/Y等），需要宽松匹配
-        amount_patterns = [
-            # 最优先：(小写) 后面的数字 - 通常是最终价格
-            r'小写[）)]*\s*[垒¥￥垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
-            # 次优先：任意¥符号后的数字
-            r'[¥￥垩圓Y垒]\s*([0-9]{1,10}\.[0-9]{2})',
-            # 备选：任意小数数字
-            r'([0-9]{1,10}\.[0-9]{2})',
-            # 中文句号格式的小数
-            r'([0-9]{1,10})[。.]([0-9]{1,2})',
-        ]
-
-        for pattern in amount_patterns:
-            if '。' in pattern or '[。.]' in pattern:
-                # 特殊处理中文句号格式
+        def _find_amount(patterns, text):
+            """通用金额提取，返回匹配到的第一个有效金额字符串"""
+            for pattern in patterns:
                 matches = re.findall(pattern, text)
                 if matches:
                     try:
-                        amounts = []
+                        vals = []
                         for m in matches:
                             if isinstance(m, tuple):
-                                amounts.append(f"{m[0]}.{m[1]}")
+                                vals.append(f"{m[0]}.{m[1]}")
                             else:
-                                amounts.append(m)
-                        result["amount"] = str(max(float(a) for a in amounts if a))
-                        break
+                                vals.append(str(m))
+                        best = str(max(float(v) for v in vals if v))
+                        # 格式化为两位小数
+                        return f"{float(best):.2f}"
                     except:
                         pass
-            else:
-                matches = re.findall(pattern, text)
-                if matches:
-                    try:
-                        result["amount"] = str(max(float(m) for m in matches))
-                        break
-                    except:
-                        pass
+            return None
+
+        # === 价税合计（总金额）===
+        # 优先找"价税合计(小写)"标签后面的数字
+        total_patterns = [
+            r'价税合计[^0-9\n]{0,10}小写[）)]*\s*[垒¥￥垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
+            r'小写[）)]*\s*[垒¥￥垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
+            r'价税合计[^0-9\n]{0,20}([0-9]{1,10}\.[0-9]{2})',
+            r'[¥￥垩圓Y垒]\s*([0-9]{1,10}\.[0-9]{2})',
+            r'([0-9]{1,10}\.[0-9]{2})',
+        ]
+        result["amount"] = _find_amount(total_patterns, text)
+
+        # === 合计金额（不含税）===
+        # 找"合计"行里的第一个金额（通常在税额左边）
+        tax_free_patterns = [
+            r'合计\s*[¥￥垒垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
+            r'(?:金额|不含税)[：:\s]*[¥￥垒垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
+        ]
+        result["tax_free_amount"] = _find_amount(tax_free_patterns, text)
+
+        # === 合计税额 ===
+        tax_patterns = [
+            r'(?:合计税额|税\s*额)[：:\s]*[¥￥垒垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
+            r'税\s*额[^0-9\n]{0,10}([0-9]{1,10}\.[0-9]{2})',
+        ]
+        result["tax_amount"] = _find_amount(tax_patterns, text)
+
+        # 兜底：如果总金额、不含税金额都找到了，可以推算税额
+        if result["amount"] and result["tax_free_amount"] and not result["tax_amount"]:
+            try:
+                tax = float(result["amount"]) - float(result["tax_free_amount"])
+                if tax > 0:
+                    result["tax_amount"] = f"{tax:.2f}"
+            except:
+                pass
 
         return result
 
@@ -511,6 +528,9 @@ def file_too_large(e):
 
 @app.errorhandler(Exception)
 def handle_exception(e):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
     import traceback
     print(f"未处理异常: {traceback.format_exc()}")
     return jsonify({'error': f'服务器内部错误: {str(e)}'}), 500

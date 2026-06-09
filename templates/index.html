@@ -591,7 +591,13 @@
                                 <span class="field-label">销售方:</span> ${data_obj.supplier || '-'}
                             </div>
                             <div class="field">
-                                <span class="field-label">金额:</span> ${data_obj.amount || '-'}
+                                <span class="field-label">金额（不含税）:</span> ${data_obj.tax_free_amount ? data_obj.tax_free_amount + ' 元' : '-'}
+                            </div>
+                            <div class="field">
+                                <span class="field-label">税额:</span> ${data_obj.tax_amount ? data_obj.tax_amount + ' 元' : '-'}
+                            </div>
+                            <div class="field">
+                                <span class="field-label">价税合计:</span> ${data_obj.amount ? data_obj.amount + ' 元' : '-'}
                             </div>
                         </div>
                         <span class="file-status success">✓ 识别成功</span>
