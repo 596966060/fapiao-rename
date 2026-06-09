@@ -125,6 +125,8 @@ class InvoiceExtractor:
                 if not fields.get(key) and filename_fields.get(key):
                     fields[key] = filename_fields[key]
 
+            # 保留原始 OCR 文本供前端调试展示
+            fields['_raw_text'] = text
             return fields
         except Exception as e:
             raise Exception(f"提取失败: {e}")
@@ -280,27 +282,45 @@ class InvoiceExtractor:
         ]
         result["amount"] = _find_amount(total_patterns, text)
 
-        # === 合计金额（不含税）===
-        # 找"合计"行里的第一个金额（通常在税额左边）
-        tax_free_patterns = [
-            r'合计\s*[¥￥垒垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
-            r'(?:金额|不含税)[：:\s]*[¥￥垒垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
-        ]
-        result["tax_free_amount"] = _find_amount(tax_free_patterns, text)
+        # === 合计行：同时捕获不含税金额 + 税额 ===
+        # 典型格式：合计  ¥232.57  ¥33.74  （金额在左，税额在右，同一行）
+        amtpat = r'[¥￥垒垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})'
+        two_num = re.search(
+            r'合计\s*' + amtpat + r'\s*' + amtpat, text)
+        if two_num:
+            result["tax_free_amount"] = f"{float(two_num.group(1)):.2f}"
+            result["tax_amount"]      = f"{float(two_num.group(2)):.2f}"
+        else:
+            # OCR 可能将合计行拆成多行，逐列尝试
+            # 不含税金额：合计 / 金额 标签附近的第一个小数
+            tax_free_patterns = [
+                r'合计\s*' + amtpat,
+                r'(?:不含税|金额)[：:\s]*' + amtpat,
+            ]
+            result["tax_free_amount"] = _find_amount(tax_free_patterns, text)
 
-        # === 合计税额 ===
-        tax_patterns = [
-            r'(?:合计税额|税\s*额)[：:\s]*[¥￥垒垩圓Y]?\s*([0-9]{1,10}\.[0-9]{2})',
-            r'税\s*额[^0-9\n]{0,10}([0-9]{1,10}\.[0-9]{2})',
-        ]
-        result["tax_amount"] = _find_amount(tax_patterns, text)
+            # 税额：明确带"税额"标签
+            tax_patterns = [
+                r'(?:合计税额|税\s*额)[：:\s]*' + amtpat,
+                r'税\s*额[^0-9\n]{0,10}([0-9]{1,10}\.[0-9]{2})',
+            ]
+            result["tax_amount"] = _find_amount(tax_patterns, text)
 
-        # 兜底：如果总金额、不含税金额都找到了，可以推算税额
+        # 兜底推算：有价税合计 + 不含税金额 → 推出税额
         if result["amount"] and result["tax_free_amount"] and not result["tax_amount"]:
             try:
-                tax = float(result["amount"]) - float(result["tax_free_amount"])
+                tax = round(float(result["amount"]) - float(result["tax_free_amount"]), 2)
                 if tax > 0:
                     result["tax_amount"] = f"{tax:.2f}"
+            except:
+                pass
+
+        # 兜底推算：有价税合计 + 税额 → 推出不含税金额
+        if result["amount"] and result["tax_amount"] and not result["tax_free_amount"]:
+            try:
+                base = round(float(result["amount"]) - float(result["tax_amount"]), 2)
+                if base > 0:
+                    result["tax_free_amount"] = f"{base:.2f}"
             except:
                 pass
 
