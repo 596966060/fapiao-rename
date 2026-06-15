@@ -631,6 +631,51 @@ def export_csv(session_id):
 
 # ======================== 批次管理 API ========================
 
+@app.route('/api/update/<session_id>/<int:item_index>', methods=['POST'])
+def update_item(session_id, item_index):
+    """手动修改某张发票的识别字段，并重命名会话目录中的实体文件"""
+    if session_id not in UPLOAD_RESULTS:
+        return jsonify({'error': '会话已过期'}), 404
+
+    results = UPLOAD_RESULTS[session_id]['results']
+    session_dir = UPLOAD_RESULTS[session_id]['session_dir']
+
+    if item_index < 0 or item_index >= len(results):
+        return jsonify({'error': '索引越界'}), 400
+
+    item = results[item_index]
+    if item['status'] != 'success':
+        return jsonify({'error': '只能编辑成功识别的条目'}), 400
+
+    payload = request.get_json(force=True, silent=True) or {}
+    old_new_name = item.get('new_name', '')
+
+    # 更新 data 字段
+    d = item.get('data') or {}
+    for field in ('date', 'invoice_number', 'buyer', 'supplier',
+                  'tax_free_amount', 'tax_amount', 'amount'):
+        if field in payload:
+            d[field] = payload[field].strip()
+    item['data'] = d
+
+    # 重新生成文件名
+    ext = os.path.splitext(old_new_name)[1].lower()
+    new_new_name = generate_filename(d, ext)
+    item['new_name'] = new_new_name
+
+    # 重命名会话目录中的实体文件
+    old_path = os.path.join(session_dir, old_new_name)
+    new_path = os.path.join(session_dir, new_new_name)
+    if os.path.exists(old_path) and old_path != new_path:
+        try:
+            os.rename(old_path, new_path)
+        except OSError:
+            pass
+
+    results[item_index] = item
+    return jsonify({'new_name': new_new_name, 'data': d})
+
+
 @app.route('/api/batch/add/<session_id>', methods=['POST'])
 def batch_add(session_id):
     """把一次会话的结果追加到全局批次"""

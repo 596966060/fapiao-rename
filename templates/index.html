@@ -450,6 +450,73 @@
         .btn-batch-clear:hover { background: rgba(245,101,101,0.7); }
         .btn-batch-clear:disabled { opacity: 0.4; cursor: not-allowed; }
 
+        /* ---- 编辑功能 ---- */
+        .btn-edit {
+            background: none;
+            border: 1px solid #667eea;
+            color: #667eea;
+            padding: 4px 12px;
+            font-size: 12px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-top: 8px;
+        }
+        .btn-edit:hover { background: #667eea; color: white; }
+        .edit-form { display: none; margin-top: 12px; }
+        .edit-form.active { display: block; }
+        .edit-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        .edit-field label {
+            display: block;
+            font-size: 11px;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 3px;
+        }
+        .edit-field input {
+            display: block;
+            width: 100%;
+            padding: 6px 10px;
+            border: 1px solid #cbd5e0;
+            border-radius: 5px;
+            font-size: 13px;
+            color: #333;
+            transition: border-color 0.2s;
+        }
+        .edit-field input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 2px rgba(102,126,234,0.15);
+        }
+        .edit-btns { display: flex; gap: 8px; }
+        .btn-save {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 6px 18px;
+            border-radius: 5px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-save:hover { background: #764ba2; }
+        .btn-cancel {
+            background: none;
+            color: #999;
+            border: 1px solid #e2e8f0;
+            padding: 6px 14px;
+            border-radius: 5px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        .btn-cancel:hover { color: #e53e3e; border-color: #e53e3e; }
+
         @media (max-width: 600px) {
             .card {
                 padding: 20px;
@@ -678,19 +745,38 @@
                     const rawHtml = d._raw_text
                         ? `<details style="margin-top:10px;"><summary style="cursor:pointer;color:#667eea;">📋 查看原始 OCR 文本</summary>
                            <div style="margin-top:8px;padding:10px;background:#f5f5f5;border-radius:4px;font-size:11px;color:#666;max-height:150px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;">${d._raw_text}</div></details>` : '';
+
+                    const esc = s => String(s||'').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
                     div.innerHTML = `
                         <div class="file-name">📄 ${item.filename || 'Unknown'}</div>
-                        <div class="file-new-name">✓ ${item.new_name || 'No name'}</div>
-                        <div class="file-fields">
-                            <div class="field"><span class="field-label">日期:</span> ${d.date || '-'}</div>
-                            <div class="field"><span class="field-label">号码:</span> ${d.invoice_number || '-'}</div>
-                            <div class="field"><span class="field-label">购买方:</span> ${d.buyer || '-'}</div>
-                            <div class="field"><span class="field-label">销售方:</span> ${d.supplier || '-'}</div>
-                            <div class="field"><span class="field-label">金额（不含税）:</span> ${d.tax_free_amount ? d.tax_free_amount + ' 元' : '-'}</div>
-                            <div class="field"><span class="field-label">税额:</span> ${d.tax_amount ? d.tax_amount + ' 元' : '-'}</div>
-                            <div class="field"><span class="field-label">价税合计:</span> ${d.amount ? d.amount + ' 元' : '-'}</div>
+                        <div class="file-new-name" id="newname-${idx}">✓ ${item.new_name || 'No name'}</div>
+                        <div class="file-fields" id="fields-${idx}">
+                            <div class="field"><span class="field-label">日期:</span> <span id="v-date-${idx}">${d.date || '-'}</span></div>
+                            <div class="field"><span class="field-label">号码:</span> <span id="v-num-${idx}">${d.invoice_number || '-'}</span></div>
+                            <div class="field"><span class="field-label">购买方:</span> <span id="v-buyer-${idx}">${d.buyer || '-'}</span></div>
+                            <div class="field"><span class="field-label">销售方:</span> <span id="v-supplier-${idx}">${d.supplier || '-'}</span></div>
+                            <div class="field"><span class="field-label">金额（不含税）:</span> <span id="v-taxfree-${idx}">${d.tax_free_amount ? d.tax_free_amount + ' 元' : '-'}</span></div>
+                            <div class="field"><span class="field-label">税额:</span> <span id="v-tax-${idx}">${d.tax_amount ? d.tax_amount + ' 元' : '-'}</span></div>
+                            <div class="field"><span class="field-label">价税合计:</span> <span id="v-amount-${idx}">${d.amount ? d.amount + ' 元' : '-'}</span></div>
                         </div>
                         <span class="file-status success">✓ 识别成功</span>
+                        <button class="btn-edit" onclick="toggleEdit(${idx})">✏️ 编辑字段</button>
+
+                        <div class="edit-form" id="edit-form-${idx}">
+                            <div class="edit-grid">
+                                <div class="edit-field"><label>日期</label><input id="e-date-${idx}" value="${esc(d.date)}" placeholder="YYYY-MM-DD"></div>
+                                <div class="edit-field"><label>发票号码</label><input id="e-num-${idx}" value="${esc(d.invoice_number)}" placeholder="发票号码"></div>
+                                <div class="edit-field"><label>购买方</label><input id="e-buyer-${idx}" value="${esc(d.buyer)}" placeholder="购买方名称"></div>
+                                <div class="edit-field"><label>销售方</label><input id="e-supplier-${idx}" value="${esc(d.supplier)}" placeholder="销售方名称"></div>
+                                <div class="edit-field"><label>金额（不含税）</label><input id="e-taxfree-${idx}" value="${esc(d.tax_free_amount)}" placeholder="0.00"></div>
+                                <div class="edit-field"><label>税额</label><input id="e-tax-${idx}" value="${esc(d.tax_amount)}" placeholder="0.00"></div>
+                                <div class="edit-field"><label>价税合计</label><input id="e-amount-${idx}" value="${esc(d.amount)}" placeholder="0.00"></div>
+                            </div>
+                            <div class="edit-btns">
+                                <button class="btn-save" onclick="saveEdit(${idx})">💾 保存</button>
+                                <button class="btn-cancel" onclick="cancelEdit(${idx})">✕ 取消</button>
+                            </div>
+                        </div>
                         ${rawHtml}`;
                 } else {
                     div.innerHTML = `
@@ -784,6 +870,56 @@
                 showStatus('🗑️ 批次已清空', 'success');
             })
             .catch(() => showStatus('❌ 清空失败', 'error'));
+        }
+
+        // ---- 编辑字段 ----
+        function toggleEdit(idx) {
+            const form = document.getElementById(`edit-form-${idx}`);
+            form.classList.toggle('active');
+        }
+
+        function cancelEdit(idx) {
+            document.getElementById(`edit-form-${idx}`).classList.remove('active');
+        }
+
+        function saveEdit(idx) {
+            if (!currentSessionId) return;
+            const payload = {
+                date:           document.getElementById(`e-date-${idx}`).value,
+                invoice_number: document.getElementById(`e-num-${idx}`).value,
+                buyer:          document.getElementById(`e-buyer-${idx}`).value,
+                supplier:       document.getElementById(`e-supplier-${idx}`).value,
+                tax_free_amount:document.getElementById(`e-taxfree-${idx}`).value,
+                tax_amount:     document.getElementById(`e-tax-${idx}`).value,
+                amount:         document.getElementById(`e-amount-${idx}`).value,
+            };
+            const btn = document.querySelector(`#edit-form-${idx} .btn-save`);
+            btn.disabled = true;
+            btn.textContent = '⏳ 保存中...';
+
+            fetch(`/api/update/${currentSessionId}/${idx}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(r => r.json())
+            .then(res => {
+                if (res.error) { showStatus(`❌ ${res.error}`, 'error'); return; }
+                const d = res.data;
+                // 更新显示值
+                document.getElementById(`newname-${idx}`).textContent = '✓ ' + res.new_name;
+                document.getElementById(`v-date-${idx}`).textContent     = d.date || '-';
+                document.getElementById(`v-num-${idx}`).textContent      = d.invoice_number || '-';
+                document.getElementById(`v-buyer-${idx}`).textContent    = d.buyer || '-';
+                document.getElementById(`v-supplier-${idx}`).textContent = d.supplier || '-';
+                document.getElementById(`v-taxfree-${idx}`).textContent  = d.tax_free_amount ? d.tax_free_amount + ' 元' : '-';
+                document.getElementById(`v-tax-${idx}`).textContent      = d.tax_amount ? d.tax_amount + ' 元' : '-';
+                document.getElementById(`v-amount-${idx}`).textContent   = d.amount ? d.amount + ' 元' : '-';
+                document.getElementById(`edit-form-${idx}`).classList.remove('active');
+                showStatus('✅ 已保存，文件名已同步更新', 'success');
+            })
+            .catch(() => showStatus('❌ 保存失败', 'error'))
+            .finally(() => { btn.disabled = false; btn.textContent = '💾 保存'; });
         }
 
         // ---- 重新开始（只清本次，不清批次）----
