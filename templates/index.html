@@ -737,9 +737,14 @@
                 div.className = `file-item ${item.status}`;
 
                 if (item.status === 'success') {
-                    const d = item.data || {};
+                    const d        = item.data || {};
+                    const isTrain  = item.doc_type === 'train';
+                    const typeTag  = isTrain
+                        ? `<span style="background:#2b6cb0;color:white;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;">🚄 火车票</span>`
+                        : `<span style="background:#276749;color:white;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;">🧾 发票</span>`;
+
                     if (d._raw_text) {
-                        console.log(`\n--- File ${idx + 1}: ${item.filename} ---`);
+                        console.log(`\n--- File ${idx + 1}: ${item.filename} [${item.doc_type || 'invoice'}] ---`);
                         console.log('Raw OCR Text:\n' + d._raw_text);
                     }
                     const rawHtml = d._raw_text
@@ -747,31 +752,57 @@
                            <div style="margin-top:8px;padding:10px;background:#f5f5f5;border-radius:4px;font-size:11px;color:#666;max-height:150px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;">${d._raw_text}</div></details>` : '';
 
                     const esc = s => String(s||'').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-                    div.innerHTML = `
-                        <div class="file-name">📄 ${item.filename || 'Unknown'}</div>
-                        <div class="file-new-name" id="newname-${idx}">✓ ${item.new_name || 'No name'}</div>
-                        <div class="file-fields" id="fields-${idx}">
-                            <div class="field"><span class="field-label">日期:</span> <span id="v-date-${idx}">${d.date || '-'}</span></div>
-                            <div class="field"><span class="field-label">号码:</span> <span id="v-num-${idx}">${d.invoice_number || '-'}</span></div>
-                            <div class="field"><span class="field-label">购买方:</span> <span id="v-buyer-${idx}">${d.buyer || '-'}</span></div>
-                            <div class="field"><span class="field-label">销售方:</span> <span id="v-supplier-${idx}">${d.supplier || '-'}</span></div>
-                            <div class="field"><span class="field-label">金额（不含税）:</span> <span id="v-taxfree-${idx}">${d.tax_free_amount ? d.tax_free_amount + ' 元' : '-'}</span></div>
-                            <div class="field"><span class="field-label">税额:</span> <span id="v-tax-${idx}">${d.tax_amount ? d.tax_amount + ' 元' : '-'}</span></div>
-                            <div class="field"><span class="field-label">价税合计:</span> <span id="v-amount-${idx}">${d.amount ? d.amount + ' 元' : '-'}</span></div>
+
+                    // 字段展示区
+                    const fieldsHtml = isTrain ? `
+                        <div class="field"><span class="field-label">车次:</span> <span id="v-train-${idx}">${d.train_number || '-'}</span></div>
+                        <div class="field"><span class="field-label">出发→到达:</span> <span id="v-route-${idx}">${(d.from_station||'?')} → ${(d.to_station||'?')}</span></div>
+                        <div class="field"><span class="field-label">日期:</span> <span id="v-date-${idx}">${d.date || '-'}</span></div>
+                        <div class="field"><span class="field-label">乘客:</span> <span id="v-name-${idx}">${d.passenger_name || '-'}</span></div>
+                        <div class="field"><span class="field-label">座位:</span> <span id="v-seat-${idx}">${d.seat || '-'} ${d.seat_type ? '(' + d.seat_type + ')' : ''}</span></div>
+                        <div class="field"><span class="field-label">票价:</span> <span id="v-price-${idx}">${d.price ? d.price + ' 元' : '-'}</span></div>
+                    ` : `
+                        <div class="field"><span class="field-label">日期:</span> <span id="v-date-${idx}">${d.date || '-'}</span></div>
+                        <div class="field"><span class="field-label">号码:</span> <span id="v-num-${idx}">${d.invoice_number || '-'}</span></div>
+                        <div class="field"><span class="field-label">购买方:</span> <span id="v-buyer-${idx}">${d.buyer || '-'}</span></div>
+                        <div class="field"><span class="field-label">销售方:</span> <span id="v-supplier-${idx}">${d.supplier || '-'}</span></div>
+                        <div class="field"><span class="field-label">金额（不含税）:</span> <span id="v-taxfree-${idx}">${d.tax_free_amount ? d.tax_free_amount + ' 元' : '-'}</span></div>
+                        <div class="field"><span class="field-label">税额:</span> <span id="v-tax-${idx}">${d.tax_amount ? d.tax_amount + ' 元' : '-'}</span></div>
+                        <div class="field"><span class="field-label">价税合计:</span> <span id="v-amount-${idx}">${d.amount ? d.amount + ' 元' : '-'}</span></div>
+                    `;
+
+                    // 编辑表单区
+                    const editFormHtml = isTrain ? `
+                        <div class="edit-grid">
+                            <div class="edit-field"><label>日期</label><input id="e-date-${idx}" value="${esc(d.date)}" placeholder="YYYY-MM-DD"></div>
+                            <div class="edit-field"><label>车次</label><input id="e-train-${idx}" value="${esc(d.train_number)}" placeholder="G1234"></div>
+                            <div class="edit-field"><label>出发站</label><input id="e-from-${idx}" value="${esc(d.from_station)}" placeholder="上海虹桥"></div>
+                            <div class="edit-field"><label>到达站</label><input id="e-to-${idx}" value="${esc(d.to_station)}" placeholder="北京南"></div>
+                            <div class="edit-field"><label>乘客姓名</label><input id="e-pname-${idx}" value="${esc(d.passenger_name)}" placeholder="姓名"></div>
+                            <div class="edit-field"><label>座位号</label><input id="e-seat-${idx}" value="${esc(d.seat)}" placeholder="08车06A号"></div>
+                            <div class="edit-field"><label>座位类型</label><input id="e-stype-${idx}" value="${esc(d.seat_type)}" placeholder="二等座"></div>
+                            <div class="edit-field"><label>票价（元）</label><input id="e-price-${idx}" value="${esc(d.price)}" placeholder="0.00"></div>
                         </div>
+                    ` : `
+                        <div class="edit-grid">
+                            <div class="edit-field"><label>日期</label><input id="e-date-${idx}" value="${esc(d.date)}" placeholder="YYYY-MM-DD"></div>
+                            <div class="edit-field"><label>发票号码</label><input id="e-num-${idx}" value="${esc(d.invoice_number)}" placeholder="发票号码"></div>
+                            <div class="edit-field"><label>购买方</label><input id="e-buyer-${idx}" value="${esc(d.buyer)}" placeholder="购买方名称"></div>
+                            <div class="edit-field"><label>销售方</label><input id="e-supplier-${idx}" value="${esc(d.supplier)}" placeholder="销售方名称"></div>
+                            <div class="edit-field"><label>金额（不含税）</label><input id="e-taxfree-${idx}" value="${esc(d.tax_free_amount)}" placeholder="0.00"></div>
+                            <div class="edit-field"><label>税额</label><input id="e-tax-${idx}" value="${esc(d.tax_amount)}" placeholder="0.00"></div>
+                            <div class="edit-field"><label>价税合计</label><input id="e-amount-${idx}" value="${esc(d.amount)}" placeholder="0.00"></div>
+                        </div>
+                    `;
+
+                    div.innerHTML = `
+                        <div class="file-name">📄 ${item.filename || 'Unknown'}${typeTag}</div>
+                        <div class="file-new-name" id="newname-${idx}">✓ ${item.new_name || 'No name'}</div>
+                        <div class="file-fields" id="fields-${idx}">${fieldsHtml}</div>
                         <span class="file-status success">✓ 识别成功</span>
                         <button class="btn-edit" onclick="toggleEdit(${idx})">✏️ 编辑字段</button>
-
-                        <div class="edit-form" id="edit-form-${idx}">
-                            <div class="edit-grid">
-                                <div class="edit-field"><label>日期</label><input id="e-date-${idx}" value="${esc(d.date)}" placeholder="YYYY-MM-DD"></div>
-                                <div class="edit-field"><label>发票号码</label><input id="e-num-${idx}" value="${esc(d.invoice_number)}" placeholder="发票号码"></div>
-                                <div class="edit-field"><label>购买方</label><input id="e-buyer-${idx}" value="${esc(d.buyer)}" placeholder="购买方名称"></div>
-                                <div class="edit-field"><label>销售方</label><input id="e-supplier-${idx}" value="${esc(d.supplier)}" placeholder="销售方名称"></div>
-                                <div class="edit-field"><label>金额（不含税）</label><input id="e-taxfree-${idx}" value="${esc(d.tax_free_amount)}" placeholder="0.00"></div>
-                                <div class="edit-field"><label>税额</label><input id="e-tax-${idx}" value="${esc(d.tax_amount)}" placeholder="0.00"></div>
-                                <div class="edit-field"><label>价税合计</label><input id="e-amount-${idx}" value="${esc(d.amount)}" placeholder="0.00"></div>
-                            </div>
+                        <div class="edit-form" id="edit-form-${idx}" data-doctype="${isTrain ? 'train' : 'invoice'}">
+                            ${editFormHtml}
                             <div class="edit-btns">
                                 <button class="btn-save" onclick="saveEdit(${idx})">💾 保存</button>
                                 <button class="btn-cancel" onclick="cancelEdit(${idx})">✕ 取消</button>
@@ -884,15 +915,29 @@
 
         function saveEdit(idx) {
             if (!currentSessionId) return;
-            const payload = {
-                date:           document.getElementById(`e-date-${idx}`).value,
-                invoice_number: document.getElementById(`e-num-${idx}`).value,
-                buyer:          document.getElementById(`e-buyer-${idx}`).value,
-                supplier:       document.getElementById(`e-supplier-${idx}`).value,
-                tax_free_amount:document.getElementById(`e-taxfree-${idx}`).value,
-                tax_amount:     document.getElementById(`e-tax-${idx}`).value,
-                amount:         document.getElementById(`e-amount-${idx}`).value,
+            const form    = document.getElementById(`edit-form-${idx}`);
+            const isTrain = form.dataset.doctype === 'train';
+
+            // 根据类型读取不同输入框
+            const payload = isTrain ? {
+                date:           (document.getElementById(`e-date-${idx}`) ||{}).value || '',
+                train_number:   (document.getElementById(`e-train-${idx}`)||{}).value || '',
+                from_station:   (document.getElementById(`e-from-${idx}`) ||{}).value || '',
+                to_station:     (document.getElementById(`e-to-${idx}`)   ||{}).value || '',
+                passenger_name: (document.getElementById(`e-pname-${idx}`)||{}).value || '',
+                seat:           (document.getElementById(`e-seat-${idx}`) ||{}).value || '',
+                seat_type:      (document.getElementById(`e-stype-${idx}`)||{}).value || '',
+                price:          (document.getElementById(`e-price-${idx}`)||{}).value || '',
+            } : {
+                date:           (document.getElementById(`e-date-${idx}`)   ||{}).value || '',
+                invoice_number: (document.getElementById(`e-num-${idx}`)    ||{}).value || '',
+                buyer:          (document.getElementById(`e-buyer-${idx}`)  ||{}).value || '',
+                supplier:       (document.getElementById(`e-supplier-${idx}`)||{}).value || '',
+                tax_free_amount:(document.getElementById(`e-taxfree-${idx}`)||{}).value || '',
+                tax_amount:     (document.getElementById(`e-tax-${idx}`)    ||{}).value || '',
+                amount:         (document.getElementById(`e-amount-${idx}`) ||{}).value || '',
             };
+
             const btn = document.querySelector(`#edit-form-${idx} .btn-save`);
             btn.disabled = true;
             btn.textContent = '⏳ 保存中...';
@@ -906,16 +951,26 @@
             .then(res => {
                 if (res.error) { showStatus(`❌ ${res.error}`, 'error'); return; }
                 const d = res.data;
-                // 更新显示值
                 document.getElementById(`newname-${idx}`).textContent = '✓ ' + res.new_name;
-                document.getElementById(`v-date-${idx}`).textContent     = d.date || '-';
-                document.getElementById(`v-num-${idx}`).textContent      = d.invoice_number || '-';
-                document.getElementById(`v-buyer-${idx}`).textContent    = d.buyer || '-';
-                document.getElementById(`v-supplier-${idx}`).textContent = d.supplier || '-';
-                document.getElementById(`v-taxfree-${idx}`).textContent  = d.tax_free_amount ? d.tax_free_amount + ' 元' : '-';
-                document.getElementById(`v-tax-${idx}`).textContent      = d.tax_amount ? d.tax_amount + ' 元' : '-';
-                document.getElementById(`v-amount-${idx}`).textContent   = d.amount ? d.amount + ' 元' : '-';
-                document.getElementById(`edit-form-${idx}`).classList.remove('active');
+                if (res.doc_type === 'train') {
+                    const setT = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                    setT(`v-train-${idx}`, d.train_number || '-');
+                    setT(`v-route-${idx}`, `${d.from_station||'?'} → ${d.to_station||'?'}`);
+                    setT(`v-date-${idx}`,  d.date || '-');
+                    setT(`v-name-${idx}`,  d.passenger_name || '-');
+                    setT(`v-seat-${idx}`,  (d.seat || '-') + (d.seat_type ? ` (${d.seat_type})` : ''));
+                    setT(`v-price-${idx}`, d.price ? d.price + ' 元' : '-');
+                } else {
+                    const setI = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                    setI(`v-date-${idx}`,     d.date || '-');
+                    setI(`v-num-${idx}`,      d.invoice_number || '-');
+                    setI(`v-buyer-${idx}`,    d.buyer || '-');
+                    setI(`v-supplier-${idx}`, d.supplier || '-');
+                    setI(`v-taxfree-${idx}`,  d.tax_free_amount ? d.tax_free_amount + ' 元' : '-');
+                    setI(`v-tax-${idx}`,      d.tax_amount ? d.tax_amount + ' 元' : '-');
+                    setI(`v-amount-${idx}`,   d.amount ? d.amount + ' 元' : '-');
+                }
+                form.classList.remove('active');
                 showStatus('✅ 已保存，文件名已同步更新', 'success');
             })
             .catch(() => showStatus('❌ 保存失败', 'error'))

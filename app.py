@@ -347,7 +347,7 @@ class InvoiceExtractor:
 
 
 def generate_filename(data: dict, original_ext: str) -> str:
-    """生成新文件名"""
+    """生成发票新文件名"""
     date = data.get('date') or '0000-01-01'
     invoice_num = data.get('invoice_number') or '000000'
     buyer = (data.get('buyer') or '')[:20]
@@ -358,6 +358,220 @@ def generate_filename(data: dict, original_ext: str) -> str:
     new_name = re.sub(r'[\\/:*?"<>|]', '', new_name)
     new_name = re.sub(r'_+', '_', new_name).strip('_')
     return new_name or f"invoice_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
+
+
+def generate_train_filename(data: dict, original_ext: str) -> str:
+    """生成火车票新文件名: 日期_车次_出发站-到达站_姓名_票价元.ext"""
+    date      = data.get('date') or '0000-01-01'
+    train     = data.get('train_number') or '000'
+    from_st   = (data.get('from_station') or '')[:10]
+    to_st     = (data.get('to_station') or '')[:10]
+    name      = (data.get('passenger_name') or '')[:10]
+    price     = data.get('price') or '0.00'
+    route     = f"{from_st}-{to_st}" if (from_st or to_st) else ''
+    parts     = [p for p in [date, train, route, name, f"{price}元"] if p]
+    new_name  = '_'.join(parts) + original_ext
+    new_name  = re.sub(r'[\\/:*?"<>|]', '', new_name)
+    new_name  = re.sub(r'_+', '_', new_name).strip('_')
+    return new_name or f"train_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
+
+
+# ======================== 火车票提取 ========================
+
+# 火车票关键词集合（用于类型检测）
+_TRAIN_KEYWORDS = re.compile(
+    r'车\s*次|检\s*票|候\s*车|动\s*车|高\s*铁|火\s*车\s*票|硬\s*卧|软\s*卧|硬\s*座|'
+    r'二\s*等\s*座|一\s*等\s*座|商\s*务\s*座|无\s*座|出\s*发\s*站|到\s*达\s*站|'
+    r'网络购票|铁路电子客票|中国铁路|12306|票价[：:\s]*[¥￥]?\d'
+)
+_TRAIN_NUMBER_RE = re.compile(r'\b([GDTZKCY]\d{1,4})\b')
+
+
+def detect_doc_type(text: str) -> str:
+    """根据 OCR 文本判断是火车票还是发票，返回 'train' 或 'invoice'"""
+    if _TRAIN_KEYWORDS.search(text):
+        return 'train'
+    if _TRAIN_NUMBER_RE.search(text):
+        return 'train'
+    return 'invoice'
+
+
+class TrainTicketExtractor:
+    """火车票 OCR 字段提取"""
+
+    # 站名结尾词（帮助识别站名）
+    _STATION_SUFFIX = re.compile(r'[\u4e00-\u9fa5]{2,8}(?:站|虹桥|南|北|东|西|高铁)?')
+    # 座位类型
+    _SEAT_TYPES = ['商务座', '特等座', '一等座', '二等座', '软卧上', '软卧下', '硬卧上', '硬卧中',
+                   '硬卧下', '软卧', '硬卧', '硬座', '无座', '动卧']
+
+    def __init__(self, reader):
+        self.reader = reader
+
+    # 复用 InvoiceExtractor 的图像读取方法（避免重复）
+    def _pdf_to_image(self, pdf_path):
+        try:
+            from pdf2image import convert_from_path
+            images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=200)
+            if not images:
+                raise Exception("PDF 无法转换")
+            return cv2.cvtColor(np.array(images[0]), cv2.COLOR_RGB2BGR)
+        except ImportError:
+            raise Exception("缺少 pdf2image 库")
+        except Exception as e:
+            raise Exception(f"PDF 转图片失败: {e}")
+
+    def _image_file_to_array(self, image_path):
+        try:
+            image = Image.open(image_path).convert('RGB')
+            return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            raise Exception(f"图片读取失败: {e}")
+
+    def _preprocess(self, image):
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+        except:
+            return image
+
+    def extract(self, file_path: str) -> dict:
+        file_path = Path(file_path)
+        ext = file_path.suffix.lower()
+        if ext == '.pdf':
+            img = self._pdf_to_image(str(file_path))
+        else:
+            img = self._image_file_to_array(str(file_path))
+        if img is None or img.size == 0:
+            raise Exception("无法读取图像")
+        img = self._preprocess(img)
+        results = self.reader.readtext(img, detail=0)
+        if not results:
+            raise Exception("OCR 无法识别")
+        text = '\n'.join(results)
+        fields = self._extract_fields(text, str(file_path.stem))
+        fields['_raw_text'] = text
+        return fields
+
+    def _extract_fields(self, text: str, stem: str = '') -> dict:
+        result = {
+            'date': None,
+            'train_number': None,
+            'from_station': None,
+            'to_station': None,
+            'passenger_name': None,
+            'seat': None,
+            'seat_type': None,
+            'price': None,
+            'depart_time': None,
+        }
+
+        # === 车次 ===
+        m = _TRAIN_NUMBER_RE.search(text)
+        if m:
+            result['train_number'] = m.group(1)
+
+        # === 日期 ===
+        date_pats = [
+            (r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', 1, 2, 3),
+            (r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', 1, 2, 3),
+            (r'(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)', 1, 2, 3),
+        ]
+        for pat, gi, gm, gd in date_pats:
+            m = re.search(pat, text)
+            if m:
+                try:
+                    y, mo, d = int(m.group(gi)), int(m.group(gm)), int(m.group(gd))
+                    if 1900 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+                        result['date'] = f'{y:04d}-{mo:02d}-{d:02d}'
+                        break
+                except:
+                    pass
+
+        # === 出发时间 ===
+        m = re.search(r'(\d{2}):(\d{2})(?::(\d{2}))?', text)
+        if m:
+            result['depart_time'] = m.group(0)[:5]
+
+        # === 出发站 / 到达站 ===
+        # 优先：标签法
+        from_m = re.search(r'(?:出发站|始发站)[：:\s]*([^\n\s→\-]{2,8})', text)
+        to_m   = re.search(r'(?:到达站|终到站|目的地)[：:\s]*([^\n\s→\-]{2,8})', text)
+        if from_m:
+            result['from_station'] = from_m.group(1).strip()
+        if to_m:
+            result['to_station'] = to_m.group(1).strip()
+
+        # 备用：箭头/横线分隔  上海虹桥→北京南  或  上海虹桥-北京南
+        if not result['from_station'] or not result['to_station']:
+            arrow = re.search(
+                r'([\u4e00-\u9fa5]{2,8}(?:站)?)\s*[→\-\—]\s*([\u4e00-\u9fa5]{2,8}(?:站)?)',
+                text)
+            if arrow:
+                result.setdefault('from_station', arrow.group(1).strip()) or \
+                    result.update({'from_station': arrow.group(1).strip()})
+                result.setdefault('to_station', arrow.group(2).strip()) or \
+                    result.update({'to_station': arrow.group(2).strip()})
+                if not result['from_station']:
+                    result['from_station'] = arrow.group(1).strip()
+                if not result['to_station']:
+                    result['to_station'] = arrow.group(2).strip()
+
+        # 备用：连续中文（X站 Y站）
+        if not result['from_station'] or not result['to_station']:
+            stations = re.findall(r'([\u4e00-\u9fa5]{2,8}站)', text)
+            if len(stations) >= 2 and not result['from_station']:
+                result['from_station'] = stations[0].rstrip('站') if stations[0].endswith('站') else stations[0]
+                result['to_station']   = stations[1].rstrip('站') if stations[1].endswith('站') else stations[1]
+            elif len(stations) == 1 and not result['from_station']:
+                result['from_station'] = stations[0].rstrip('站')
+
+        # === 乘客姓名 ===
+        name_m = re.search(r'(?:姓\s*名|旅\s*客)[：:\s]*([\u4e00-\u9fa5]{2,4})', text)
+        if name_m:
+            result['passenger_name'] = name_m.group(1)
+        else:
+            # 备用：身份证号前面通常是姓名（2-4个中文字）
+            id_m = re.search(r'([\u4e00-\u9fa5]{2,4})\s*\d{15,18}', text)
+            if id_m:
+                result['passenger_name'] = id_m.group(1)
+
+        # === 座位类型 ===
+        for st in self._SEAT_TYPES:
+            if st in text:
+                result['seat_type'] = st
+                break
+
+        # === 座位号 ===
+        seat_m = re.search(r'(\d{1,2}\s*车\s*\d{1,2}[A-F号]?)', text)
+        if seat_m:
+            result['seat'] = seat_m.group(1).strip()
+
+        # === 票价 ===
+        # 优先：票价标签
+        price_m = re.search(r'(?:票\s*价|价\s*格|金\s*额)[：:\s]*[¥￥]?\s*(\d+\.?\d*)', text)
+        if price_m:
+            result['price'] = f"{float(price_m.group(1)):.2f}"
+        else:
+            # 备用：¥ + 数字
+            price_m = re.search(r'[¥￥]\s*(\d+\.?\d*)', text)
+            if price_m:
+                result['price'] = f"{float(price_m.group(1)):.2f}"
+            else:
+                # 备用：文中最大 x.x 小数（票价通常是最大金额）
+                decimals = [float(x) for x in re.findall(r'\b(\d{1,5}\.\d{1,2})\b', text)]
+                if decimals:
+                    result['price'] = f"{max(decimals):.2f}"
+
+        # === 从文件名补充 ===
+        parts = stem.split('_')
+        for part in parts:
+            tn = _TRAIN_NUMBER_RE.match(part)
+            if tn and not result['train_number']:
+                result['train_number'] = tn.group(1)
+
+        return result
 
 
 # ======================== Flask 应用 ========================
@@ -402,6 +616,44 @@ def status():
     })
 
 
+def smart_extract(file_path: str, reader) -> tuple:
+    """OCR 一次，自动判断发票或火车票，返回 (data_dict, doc_type)"""
+    inv  = InvoiceExtractor(reader)
+    train = TrainTicketExtractor(reader)
+
+    fp  = Path(file_path)
+    ext = fp.suffix.lower()
+
+    if ext == '.pdf':
+        img = inv._pdf_to_image(str(fp))
+    else:
+        img = inv._image_file_to_array(str(fp))
+
+    if img is None or img.size == 0:
+        raise Exception("无法读取图像")
+
+    img     = inv._preprocess_image(img)
+    results = reader.readtext(img, detail=0)
+    if not results:
+        raise Exception("OCR 无法识别")
+
+    text     = '\n'.join(results)
+    doc_type = detect_doc_type(text)
+
+    if doc_type == 'train':
+        fields = train._extract_fields(text, fp.stem)
+    else:
+        fields = inv._extract_fields(text)
+        # 从文件名补充发票缺失字段
+        fn_fields = inv._extract_from_filename(fp.stem)
+        for key in ('date', 'invoice_number', 'buyer', 'supplier'):
+            if not fields.get(key) and fn_fields.get(key):
+                fields[key] = fn_fields[key]
+
+    fields['_raw_text'] = text
+    return fields, doc_type
+
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     """处理上传 - 保存文件，识别，重命名"""
@@ -417,11 +669,9 @@ def upload_file():
         if reader is None:
             return jsonify({'error': 'OCR 初始化失败'}), 500
 
-        extractor = InvoiceExtractor(reader)
         results = []
 
-        # 创建会话文件夹存储重命名后的文件
-        session_id = datetime.now().strftime('%Y%m%d%H%M%S%f')[-15:]
+        session_id  = datetime.now().strftime('%Y%m%d%H%M%S%f')[-15:]
         session_dir = os.path.join(tempfile.gettempdir(), f'invoice_session_{session_id}')
         os.makedirs(session_dir, exist_ok=True)
 
@@ -433,11 +683,7 @@ def upload_file():
             allowed_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.zip'}
 
             if ext not in allowed_ext:
-                results.append({
-                    'filename': file.filename,
-                    'status': 'error',
-                    'error': '不支持的格式'
-                })
+                results.append({'filename': file.filename, 'status': 'error', 'error': '不支持的格式'})
                 continue
 
             safe_name = re.sub(r'[^\w.\-]', '_', file.filename)
@@ -446,13 +692,14 @@ def upload_file():
 
             try:
                 if ext == '.zip':
-                    zip_results = process_zip_file(temp_path, extractor, session_dir)
+                    zip_results = process_zip_file(temp_path, reader, session_dir)
                     results.extend(zip_results)
                 else:
-                    data = extractor.extract(temp_path)
-                    new_name = generate_filename(data, ext)
+                    data, doc_type = smart_extract(temp_path, reader)
+                    new_name = (generate_train_filename(data, ext)
+                                if doc_type == 'train'
+                                else generate_filename(data, ext))
 
-                    # 保存重命名后的文件到会话目录
                     new_path = os.path.join(session_dir, new_name)
                     shutil.copy(temp_path, new_path)
 
@@ -460,37 +707,25 @@ def upload_file():
                         'filename': file.filename,
                         'new_name': new_name,
                         'data': data,
+                        'doc_type': doc_type,
                         'status': 'success'
                     })
             except Exception as e:
-                results.append({
-                    'filename': file.filename,
-                    'status': 'error',
-                    'error': str(e)
-                })
+                results.append({'filename': file.filename, 'status': 'error', 'error': str(e)})
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
 
-        # 保存会话
-        UPLOAD_RESULTS[session_id] = {
-            'results': results,
-            'session_dir': session_dir
-        }
-
-        return jsonify({
-            'session_id': session_id,
-            'total': len(results),
-            'results': results
-        })
+        UPLOAD_RESULTS[session_id] = {'results': results, 'session_dir': session_dir}
+        return jsonify({'session_id': session_id, 'total': len(results), 'results': results})
 
     except Exception as e:
         return jsonify({'error': f'处理失败: {str(e)}'}), 500
 
 
-def process_zip_file(zip_path: str, extractor: InvoiceExtractor, session_dir: str) -> list:
-    """处理 ZIP 文件"""
-    results = []
+def process_zip_file(zip_path: str, reader, session_dir: str) -> list:
+    """处理 ZIP 文件，自动识别发票/火车票"""
+    results      = []
     temp_extract = tempfile.mkdtemp()
 
     try:
@@ -505,10 +740,11 @@ def process_zip_file(zip_path: str, extractor: InvoiceExtractor, session_dir: st
                 if ext in allowed_ext:
                     file_path = os.path.join(root, file)
                     try:
-                        data = extractor.extract(file_path)
-                        new_name = generate_filename(data, ext)
+                        data, doc_type = smart_extract(file_path, reader)
+                        new_name = (generate_train_filename(data, ext)
+                                    if doc_type == 'train'
+                                    else generate_filename(data, ext))
 
-                        # 保存到会话目录
                         new_path = os.path.join(session_dir, new_name)
                         shutil.copy(file_path, new_path)
 
@@ -516,14 +752,11 @@ def process_zip_file(zip_path: str, extractor: InvoiceExtractor, session_dir: st
                             'filename': file,
                             'new_name': new_name,
                             'data': data,
+                            'doc_type': doc_type,
                             'status': 'success'
                         })
                     except Exception as e:
-                        results.append({
-                            'filename': file,
-                            'status': 'error',
-                            'error': str(e)
-                        })
+                        results.append({'filename': file, 'status': 'error', 'error': str(e)})
     finally:
         shutil.rmtree(temp_extract, ignore_errors=True)
 
@@ -566,51 +799,77 @@ def download_results(session_id):
 
 
 def _build_csv_bytes(results: list) -> bytes:
-    """将 result 列表序列化为带 BOM 的 UTF-8 CSV bytes"""
+    """将 result 列表序列化为带 BOM 的 UTF-8 CSV bytes（支持发票 + 火车票）"""
     import csv
     output = io.StringIO()
     output.write('\ufeff')
     writer = csv.writer(output)
     writer.writerow([
-        '原文件名', '新文件名', '状态',
-        '日期', '发票号码', '购买方', '销售方',
-        '金额（不含税）', '税额', '价税合计', '错误信息'
+        '原文件名', '新文件名', '状态', '类型', '日期',
+        # 发票专属
+        '发票号码', '购买方', '销售方', '金额（不含税）', '税额', '价税合计',
+        # 火车票专属
+        '车次', '出发站', '到达站', '乘客姓名', '座位', '座位类型', '票价',
+        '错误信息'
     ])
 
-    total_tax_free = total_tax = total_amount = 0.0
+    total_invoice = total_train = 0.0
     success_count = fail_count = 0
 
     for item in results:
         if item['status'] == 'success':
-            d = item.get('data') or {}
-            tax_free = d.get('tax_free_amount', '')
-            tax      = d.get('tax_amount', '')
-            amount   = d.get('amount', '')
-            writer.writerow([
-                item.get('filename', ''), item.get('new_name', ''), '成功',
-                d.get('date', ''), d.get('invoice_number', ''),
-                d.get('buyer', ''), d.get('supplier', ''),
-                tax_free, tax, amount, ''
-            ])
-            try: total_tax_free += float(tax_free) if tax_free else 0
-            except ValueError: pass
-            try: total_tax += float(tax) if tax else 0
-            except ValueError: pass
-            try: total_amount += float(amount) if amount else 0
-            except ValueError: pass
+            d        = item.get('data') or {}
+            dtype    = item.get('doc_type', 'invoice')
+            is_train = dtype == 'train'
+
+            if is_train:
+                price = d.get('price', '')
+                writer.writerow([
+                    item.get('filename', ''), item.get('new_name', ''), '成功', '🚄 火车票',
+                    d.get('date', ''),
+                    '', '', '', '', '', '',          # 发票列留空
+                    d.get('train_number', ''),
+                    d.get('from_station', ''),
+                    d.get('to_station', ''),
+                    d.get('passenger_name', ''),
+                    d.get('seat', ''),
+                    d.get('seat_type', ''),
+                    price, ''
+                ])
+                try: total_train += float(price) if price else 0
+                except ValueError: pass
+            else:
+                tax_free = d.get('tax_free_amount', '')
+                tax      = d.get('tax_amount', '')
+                amount   = d.get('amount', '')
+                writer.writerow([
+                    item.get('filename', ''), item.get('new_name', ''), '成功', '🧾 发票',
+                    d.get('date', ''),
+                    d.get('invoice_number', ''), d.get('buyer', ''), d.get('supplier', ''),
+                    tax_free, tax, amount,
+                    '', '', '', '', '', '', '',      # 火车票列留空
+                    ''
+                ])
+                try: total_invoice += float(amount) if amount else 0
+                except ValueError: pass
+
             success_count += 1
         else:
             writer.writerow([
-                item.get('filename', ''), '', '失败',
-                '', '', '', '', '', '', '', item.get('error', '')
+                item.get('filename', ''), '', '失败', '', '',
+                '', '', '', '', '', '',
+                '', '', '', '', '', '', '',
+                item.get('error', '')
             ])
             fail_count += 1
 
     writer.writerow([])
     writer.writerow([
         f'合计（成功 {success_count} 张，失败 {fail_count} 张）',
-        '', '', '', '', '', '',
-        f'{total_tax_free:.2f}', f'{total_tax:.2f}', f'{total_amount:.2f}', ''
+        '', '', '', '',
+        '', '', '', '', '', f'{total_invoice:.2f}',
+        '', '', '', '', '', '', f'{total_train:.2f}',
+        ''
     ])
     return output.getvalue().encode('utf-8-sig')
 
@@ -633,11 +892,11 @@ def export_csv(session_id):
 
 @app.route('/api/update/<session_id>/<int:item_index>', methods=['POST'])
 def update_item(session_id, item_index):
-    """手动修改某张发票的识别字段，并重命名会话目录中的实体文件"""
+    """手动修改识别字段（发票或火车票），并同步重命名实体文件"""
     if session_id not in UPLOAD_RESULTS:
         return jsonify({'error': '会话已过期'}), 404
 
-    results = UPLOAD_RESULTS[session_id]['results']
+    results     = UPLOAD_RESULTS[session_id]['results']
     session_dir = UPLOAD_RESULTS[session_id]['session_dir']
 
     if item_index < 0 or item_index >= len(results):
@@ -647,23 +906,27 @@ def update_item(session_id, item_index):
     if item['status'] != 'success':
         return jsonify({'error': '只能编辑成功识别的条目'}), 400
 
-    payload = request.get_json(force=True, silent=True) or {}
+    payload      = request.get_json(force=True, silent=True) or {}
     old_new_name = item.get('new_name', '')
+    doc_type     = item.get('doc_type', 'invoice')
+    d            = item.get('data') or {}
 
-    # 更新 data 字段
-    d = item.get('data') or {}
-    for field in ('date', 'invoice_number', 'buyer', 'supplier',
-                  'tax_free_amount', 'tax_amount', 'amount'):
+    # 更新字段（发票 + 火车票字段均接受，只更新有值的）
+    all_fields = ('date', 'invoice_number', 'buyer', 'supplier',
+                  'tax_free_amount', 'tax_amount', 'amount',
+                  'train_number', 'from_station', 'to_station',
+                  'passenger_name', 'seat', 'seat_type', 'price')
+    for field in all_fields:
         if field in payload:
             d[field] = payload[field].strip()
     item['data'] = d
 
-    # 重新生成文件名
-    ext = os.path.splitext(old_new_name)[1].lower()
-    new_new_name = generate_filename(d, ext)
+    ext          = os.path.splitext(old_new_name)[1].lower()
+    new_new_name = (generate_train_filename(d, ext)
+                    if doc_type == 'train'
+                    else generate_filename(d, ext))
     item['new_name'] = new_new_name
 
-    # 重命名会话目录中的实体文件
     old_path = os.path.join(session_dir, old_new_name)
     new_path = os.path.join(session_dir, new_new_name)
     if os.path.exists(old_path) and old_path != new_path:
@@ -673,7 +936,7 @@ def update_item(session_id, item_index):
             pass
 
     results[item_index] = item
-    return jsonify({'new_name': new_new_name, 'data': d})
+    return jsonify({'new_name': new_new_name, 'data': d, 'doc_type': doc_type})
 
 
 @app.route('/api/batch/add/<session_id>', methods=['POST'])
