@@ -16,6 +16,10 @@ import re
 import io
 from datetime import datetime
 import threading
+import openpyxl
+from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
+                              GradientFill)
+from openpyxl.utils import get_column_letter
 
 # PDF 和图像处理
 from PIL import Image
@@ -874,6 +878,220 @@ def _build_csv_bytes(results: list) -> bytes:
     return output.getvalue().encode('utf-8-sig')
 
 
+def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> bytes:
+    """将 result 列表序列化为带格式的 .xlsx bytes（支持发票 + 火车票）"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '汇总表'
+
+    # ---- 颜色 & 样式常量 ----
+    C_INVOICE_HDR = 'FF276749'   # 深绿（发票表头）
+    C_TRAIN_HDR   = 'FF2B6CB0'   # 深蓝（火车票表头）
+    C_META_HDR    = 'FF4A5568'   # 深灰（公共表头）
+    C_INVOICE_ROW = 'FFE6F4EA'   # 浅绿（发票行底色）
+    C_TRAIN_ROW   = 'FFE8F0FE'   # 浅蓝（火车票行底色）
+    C_FAIL_ROW    = 'FFFFF3CD'   # 浅黄（失败行底色）
+    C_SUM_ROW     = 'FFFFF8E1'   # 浅橙（汇总行底色）
+    WHITE         = 'FFFFFFFF'
+
+    thin = Side(style='thin', color='FFCCCCCC')
+    bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def hdr_font(color='FFFFFFFF', bold=True):
+        return Font(name='微软雅黑', bold=bold, color=color, size=10)
+
+    def cell_font(bold=False, color='FF333333'):
+        return Font(name='微软雅黑', bold=bold, color=color, size=9)
+
+    def fill(hex_color):
+        return PatternFill('solid', fgColor=hex_color)
+
+    def center():
+        return Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+    def left():
+        return Alignment(horizontal='left', vertical='center', wrap_text=True)
+
+    # ---- 标题行 ----
+    NCOLS = 20
+    ws.merge_cells(f'A1:{get_column_letter(NCOLS)}1')
+    title_cell = ws['A1']
+    title_cell.value     = title
+    title_cell.font      = Font(name='微软雅黑', bold=True, size=14, color=WHITE)
+    title_cell.fill      = fill('FF4A5568')
+    title_cell.alignment = center()
+    ws.row_dimensions[1].height = 32
+
+    # ---- 表头（第2行）----
+    HEADERS = [
+        '原文件名', '新文件名', '状态', '类型', '日期',
+        # 发票专属（6列）
+        '发票号码', '购买方', '销售方', '金额(不含税)', '税额', '价税合计',
+        # 火车票专属（7列）
+        '车次', '出发站', '到达站', '乘客姓名', '座位', '座位类型', '票价',
+        '错误信息', '备注',
+    ]
+    # 列宽
+    COL_WIDTHS = [26, 36, 8, 10, 12,
+                  18, 20, 20, 14, 12, 12,
+                  10, 14, 14, 14, 14, 10, 10,
+                  20, 8]
+
+    # 表头颜色分组
+    HDR_COLORS = {
+        1: C_META_HDR, 2: C_META_HDR, 3: C_META_HDR, 4: C_META_HDR, 5: C_META_HDR,
+        6: C_INVOICE_HDR, 7: C_INVOICE_HDR, 8: C_INVOICE_HDR,
+        9: C_INVOICE_HDR, 10: C_INVOICE_HDR, 11: C_INVOICE_HDR,
+        12: C_TRAIN_HDR, 13: C_TRAIN_HDR, 14: C_TRAIN_HDR,
+        15: C_TRAIN_HDR, 16: C_TRAIN_HDR, 17: C_TRAIN_HDR, 18: C_TRAIN_HDR,
+        19: C_META_HDR, 20: C_META_HDR,
+    }
+    for col_i, (hdr, width) in enumerate(zip(HEADERS, COL_WIDTHS), start=1):
+        c = ws.cell(row=2, column=col_i, value=hdr)
+        c.font      = hdr_font(color=WHITE)
+        c.fill      = fill(HDR_COLORS.get(col_i, C_META_HDR))
+        c.alignment = center()
+        c.border    = bdr
+        ws.column_dimensions[get_column_letter(col_i)].width = width
+    ws.row_dimensions[2].height = 22
+
+    # ---- 数据行 ----
+    total_invoice = total_train = 0.0
+    success_count = fail_count  = 0
+    data_start_row = 3
+
+    for row_i, item in enumerate(results, start=data_start_row):
+        is_train = item.get('doc_type') == 'train'
+        is_ok    = item['status'] == 'success'
+        d        = item.get('data') or {}
+
+        # 行底色
+        if not is_ok:
+            row_fill = fill(C_FAIL_ROW)
+        elif is_train:
+            row_fill = fill(C_TRAIN_ROW)
+        else:
+            row_fill = fill(C_INVOICE_ROW)
+
+        def set_cell(col, val, bold=False, num_fmt=None, align=None):
+            c = ws.cell(row=row_i, column=col, value=val)
+            c.font      = cell_font(bold=bold)
+            c.fill      = row_fill
+            c.border    = bdr
+            c.alignment = align or left()
+            if num_fmt:
+                c.number_format = num_fmt
+
+        if is_ok:
+            type_label = '火车票' if is_train else '发票'
+            set_cell(1, item.get('filename', ''))
+            set_cell(2, item.get('new_name', ''), bold=True)
+            set_cell(3, '成功', align=center())
+            set_cell(4, type_label, align=center())
+            set_cell(5, d.get('date', ''), align=center())
+
+            if is_train:
+                price_str = d.get('price', '')
+                # 发票列留空
+                for col in range(6, 12):
+                    set_cell(col, '')
+                set_cell(12, d.get('train_number', ''), align=center())
+                set_cell(13, d.get('from_station', ''))
+                set_cell(14, d.get('to_station', ''))
+                set_cell(15, d.get('passenger_name', ''))
+                set_cell(16, d.get('seat', ''), align=center())
+                set_cell(17, d.get('seat_type', ''), align=center())
+                try:
+                    price_val = float(price_str) if price_str else None
+                    c = ws.cell(row=row_i, column=18, value=price_val)
+                    c.font = cell_font(); c.fill = row_fill; c.border = bdr
+                    c.alignment = center(); c.number_format = '#,##0.00'
+                    if price_val: total_train += price_val
+                except (ValueError, TypeError):
+                    set_cell(18, price_str, align=center())
+            else:
+                tax_free = d.get('tax_free_amount', '')
+                tax      = d.get('tax_amount', '')
+                amount   = d.get('amount', '')
+                def num_cell(col, val_str):
+                    try:
+                        v = float(val_str) if val_str else None
+                        c = ws.cell(row=row_i, column=col, value=v)
+                        c.font = cell_font(); c.fill = row_fill; c.border = bdr
+                        c.alignment = center(); c.number_format = '#,##0.00'
+                        return v or 0
+                    except (ValueError, TypeError):
+                        set_cell(col, val_str, align=center())
+                        return 0
+                set_cell(6,  d.get('invoice_number', ''), align=center())
+                set_cell(7,  d.get('buyer', ''))
+                set_cell(8,  d.get('supplier', ''))
+                num_cell(9,  tax_free)
+                num_cell(10, tax)
+                total_invoice += num_cell(11, amount)
+                # 火车票列留空
+                for col in range(12, 19):
+                    set_cell(col, '')
+            set_cell(19, '')
+            set_cell(20, '')
+            success_count += 1
+        else:
+            set_cell(1, item.get('filename', ''))
+            for col in range(2, 19):
+                set_cell(col, '')
+            set_cell(3, '失败', align=center())
+            set_cell(19, item.get('error', ''))
+            set_cell(20, '')
+            fail_count += 1
+
+        ws.row_dimensions[row_i].height = 18
+
+    # ---- 汇总行 ----
+    sum_row = data_start_row + len(results)
+    ws.merge_cells(f'A{sum_row}:D{sum_row}')
+    sc = ws.cell(row=sum_row, column=1,
+                 value=f'合计：成功 {success_count} 张，失败 {fail_count} 张')
+    sc.font = Font(name='微软雅黑', bold=True, size=10, color='FF333333')
+    sc.fill = fill(C_SUM_ROW)
+    sc.alignment = center()
+    sc.border = bdr
+
+    # 发票合计（第11列）
+    inv_sum = ws.cell(row=sum_row, column=11, value=total_invoice)
+    inv_sum.font = Font(name='微软雅黑', bold=True, size=10, color=C_INVOICE_HDR[2:])
+    inv_sum.fill = fill(C_SUM_ROW); inv_sum.border = bdr
+    inv_sum.alignment = center(); inv_sum.number_format = '#,##0.00'
+
+    inv_lbl = ws.cell(row=sum_row, column=10, value='发票总额 ▶')
+    inv_lbl.font = Font(name='微软雅黑', bold=True, size=9); inv_lbl.fill = fill(C_SUM_ROW)
+    inv_lbl.border = bdr; inv_lbl.alignment = center()
+
+    # 火车票合计（第18列）
+    trn_sum = ws.cell(row=sum_row, column=18, value=total_train)
+    trn_sum.font = Font(name='微软雅黑', bold=True, size=10, color=C_TRAIN_HDR[2:])
+    trn_sum.fill = fill(C_SUM_ROW); trn_sum.border = bdr
+    trn_sum.alignment = center(); trn_sum.number_format = '#,##0.00'
+
+    trn_lbl = ws.cell(row=sum_row, column=17, value='火车票总额 ▶')
+    trn_lbl.font = Font(name='微软雅黑', bold=True, size=9); trn_lbl.fill = fill(C_SUM_ROW)
+    trn_lbl.border = bdr; trn_lbl.alignment = center()
+
+    # 其余汇总格
+    for col in [5,6,7,8,9,12,13,14,15,16,19,20]:
+        c = ws.cell(row=sum_row, column=col, value='')
+        c.fill = fill(C_SUM_ROW); c.border = bdr
+
+    ws.row_dimensions[sum_row].height = 22
+
+    # ---- 冻结首两行 ----
+    ws.freeze_panes = 'A3'
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
 @app.route('/api/export/<session_id>', methods=['GET'])
 def export_csv(session_id):
     """导出本次识别结果为 CSV 表格"""
@@ -885,6 +1103,22 @@ def export_csv(session_id):
         mimetype='text/csv; charset=utf-8-sig',
         as_attachment=True,
         download_name=f'发票识别结果_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    )
+
+
+@app.route('/api/export-excel/<session_id>', methods=['GET'])
+def export_excel(session_id):
+    """导出本次识别结果为 Excel 表格"""
+    if session_id not in UPLOAD_RESULTS:
+        return jsonify({'error': '会话已过期'}), 400
+    results = UPLOAD_RESULTS[session_id]['results']
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    xlsx_bytes = _build_excel_bytes(results, title=f'识别结果汇总 — {ts}')
+    return send_file(
+        io.BytesIO(xlsx_bytes),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=f'发票识别结果_{ts}.xlsx'
     )
 
 
@@ -1008,6 +1242,23 @@ def batch_export():
                      mimetype='text/csv; charset=utf-8-sig',
                      as_attachment=True,
                      download_name=f'发票批次汇总_{ts}.csv')
+
+
+@app.route('/api/batch/export-excel', methods=['GET'])
+def batch_export_excel():
+    """导出批次全部结果为 Excel"""
+    with BATCH_LOCK:
+        results = list(BATCH_RESULTS)
+    if not results:
+        return jsonify({'error': '批次为空'}), 404
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    xlsx_bytes = _build_excel_bytes(results, title=f'批次汇总表 — {ts}')
+    return send_file(
+        io.BytesIO(xlsx_bytes),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=f'发票批次汇总_{ts}.xlsx'
+    )
 
 
 @app.route('/api/batch/clear', methods=['POST'])

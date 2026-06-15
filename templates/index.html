@@ -291,6 +291,21 @@
             transform: none;
         }
 
+        .btn-export-xl {
+            background: #276749;
+            color: white;
+        }
+        .btn-export-xl:hover {
+            background: #1e4e36;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(39, 103, 73, 0.35);
+        }
+        .btn-export-xl:disabled {
+            background: #cbd5e0;
+            cursor: not-allowed;
+            transform: none;
+        }
+
         .btn-reset {
             background: #f56565;
             color: white;
@@ -442,6 +457,12 @@
         }
         .btn-batch-exp:hover { background: #c05621; transform: translateY(-2px); }
         .btn-batch-exp:disabled { background: rgba(255,255,255,0.2); cursor: not-allowed; transform: none; }
+        .btn-batch-exp-xl {
+            background: #276749;
+            color: white;
+        }
+        .btn-batch-exp-xl:hover { background: #1e4e36; transform: translateY(-2px); box-shadow: 0 6px 16px rgba(39,103,73,0.4); }
+        .btn-batch-exp-xl:disabled { background: rgba(255,255,255,0.2); cursor: not-allowed; transform: none; }
         .btn-batch-clear {
             background: rgba(255,255,255,0.15);
             color: white;
@@ -592,7 +613,10 @@
                         ⬇️ 本次下载
                     </button>
                     <button class="btn-export" id="exportBtn" onclick="exportCSV()" disabled>
-                        📊 本次表格
+                        📊 本次 CSV
+                    </button>
+                    <button class="btn-export-xl" id="exportXlBtn" onclick="exportExcel()" disabled>
+                        📗 本次 Excel
                     </button>
                     <button class="btn-batch-add" id="addBatchBtn" onclick="addToBatch()" disabled>
                         ➕ 加入批次
@@ -622,7 +646,10 @@
                             ⬇️ 下载批次 ZIP
                         </button>
                         <button class="btn-batch-exp" id="batchExpBtn" onclick="exportBatchCSV()">
-                            📊 导出批次表格
+                            📊 批次 CSV
+                        </button>
+                        <button class="btn-batch-exp-xl" id="batchExpXlBtn" onclick="exportBatchExcel()">
+                            📗 批次 Excel
                         </button>
                         <button class="btn-batch-clear" id="batchClearBtn" onclick="clearBatch()">
                             🗑️ 清空批次
@@ -820,6 +847,7 @@
             resultsSection.classList.add('show');
             document.getElementById('downloadBtn').disabled = successFiles === 0;
             document.getElementById('exportBtn').disabled   = totalFiles === 0;
+            document.getElementById('exportXlBtn').disabled = totalFiles === 0;
             document.getElementById('addBatchBtn').disabled = totalFiles === 0;
         }
 
@@ -837,9 +865,18 @@
             if (!currentSessionId) return;
             const btn = document.getElementById('exportBtn');
             btn.disabled = true;
-            showStatus('⏳ 正在生成表格...', 'loading');
+            showStatus('⏳ 正在生成 CSV...', 'loading');
             window.location.href = `/api/export/${currentSessionId}`;
-            setTimeout(() => { btn.disabled = false; showStatus('✅ 表格已导出！', 'success'); }, 1000);
+            setTimeout(() => { btn.disabled = false; showStatus('✅ CSV 已导出！', 'success'); }, 1000);
+        }
+
+        function exportExcel() {
+            if (!currentSessionId) return;
+            const btn = document.getElementById('exportXlBtn');
+            btn.disabled = true;
+            showStatus('⏳ 正在生成 Excel...', 'loading');
+            window.location.href = `/api/export-excel/${currentSessionId}`;
+            setTimeout(() => { btn.disabled = false; showStatus('✅ Excel 已导出！', 'success'); }, 1500);
         }
 
         // ---- 批次管理 ----
@@ -885,9 +922,15 @@
         }
 
         function exportBatchCSV() {
-            showStatus('⏳ 正在生成批次表格...', 'loading');
+            showStatus('⏳ 正在生成批次 CSV...', 'loading');
             window.location.href = '/api/batch/export';
-            setTimeout(() => showStatus('✅ 批次表格已导出！', 'success'), 1000);
+            setTimeout(() => showStatus('✅ 批次 CSV 已导出！', 'success'), 1000);
+        }
+
+        function exportBatchExcel() {
+            showStatus('⏳ 正在生成批次 Excel...', 'loading');
+            window.location.href = '/api/batch/export-excel';
+            setTimeout(() => showStatus('✅ 批次 Excel 已导出！', 'success'), 1500);
         }
 
         function clearBatch() {
@@ -986,6 +1029,7 @@
             currentSessionId = null;
             uploadedResults  = [];
             document.getElementById('exportBtn').disabled   = true;
+            document.getElementById('exportXlBtn').disabled = true;
             document.getElementById('downloadBtn').disabled = true;
             document.getElementById('addBatchBtn').disabled = true;
             document.getElementById('addBatchBtn').textContent = '➕ 加入批次';
