@@ -369,6 +369,11 @@ READER = None
 READER_READY = False
 UPLOAD_RESULTS = {}
 
+# ---- 全局批次 (单服务器单用户) ----
+BATCH_RESULTS = []        # 累积的所有 result 条目
+BATCH_SESSION_DIRS = []   # 累积的 session 目录（用于下载 ZIP）
+BATCH_LOCK = threading.Lock()
+
 
 def init_ocr_background():
     """后台初始化 OCR"""
@@ -560,17 +565,10 @@ def download_results(session_id):
     )
 
 
-@app.route('/api/export/<session_id>', methods=['GET'])
-def export_csv(session_id):
-    """导出识别结果为 CSV 表格"""
-    if session_id not in UPLOAD_RESULTS:
-        return jsonify({'error': '会话已过期'}), 400
-
-    results = UPLOAD_RESULTS[session_id]['results']
-
+def _build_csv_bytes(results: list) -> bytes:
+    """将 result 列表序列化为带 BOM 的 UTF-8 CSV bytes"""
     import csv
     output = io.StringIO()
-    # UTF-8 BOM 让 Excel 正确识别中文
     output.write('\ufeff')
     writer = csv.writer(output)
     writer.writerow([
@@ -579,11 +577,8 @@ def export_csv(session_id):
         '金额（不含税）', '税额', '价税合计', '错误信息'
     ])
 
-    total_tax_free = 0.0
-    total_tax = 0.0
-    total_amount = 0.0
-    success_count = 0
-    fail_count = 0
+    total_tax_free = total_tax = total_amount = 0.0
+    success_count = fail_count = 0
 
     for item in results:
         if item['status'] == 'success':
@@ -592,59 +587,129 @@ def export_csv(session_id):
             tax      = d.get('tax_amount', '')
             amount   = d.get('amount', '')
             writer.writerow([
-                item.get('filename', ''),
-                item.get('new_name', ''),
-                '成功',
-                d.get('date', ''),
-                d.get('invoice_number', ''),
-                d.get('buyer', ''),
-                d.get('supplier', ''),
-                tax_free,
-                tax,
-                amount,
-                ''
+                item.get('filename', ''), item.get('new_name', ''), '成功',
+                d.get('date', ''), d.get('invoice_number', ''),
+                d.get('buyer', ''), d.get('supplier', ''),
+                tax_free, tax, amount, ''
             ])
-            try:
-                total_tax_free += float(tax_free) if tax_free else 0
-            except ValueError:
-                pass
-            try:
-                total_tax += float(tax) if tax else 0
-            except ValueError:
-                pass
-            try:
-                total_amount += float(amount) if amount else 0
-            except ValueError:
-                pass
+            try: total_tax_free += float(tax_free) if tax_free else 0
+            except ValueError: pass
+            try: total_tax += float(tax) if tax else 0
+            except ValueError: pass
+            try: total_amount += float(amount) if amount else 0
+            except ValueError: pass
             success_count += 1
         else:
             writer.writerow([
                 item.get('filename', ''), '', '失败',
-                '', '', '', '', '', '', '',
-                item.get('error', '')
+                '', '', '', '', '', '', '', item.get('error', '')
             ])
             fail_count += 1
 
-    # 空白分隔行
     writer.writerow([])
-    # 汇总行
     writer.writerow([
         f'合计（成功 {success_count} 张，失败 {fail_count} 张）',
-        '', '',
-        '', '', '', '',
-        f'{total_tax_free:.2f}',
-        f'{total_tax:.2f}',
-        f'{total_amount:.2f}',
-        ''
+        '', '', '', '', '', '',
+        f'{total_tax_free:.2f}', f'{total_tax:.2f}', f'{total_amount:.2f}', ''
     ])
+    return output.getvalue().encode('utf-8-sig')
 
-    csv_bytes = output.getvalue().encode('utf-8-sig')
+
+@app.route('/api/export/<session_id>', methods=['GET'])
+def export_csv(session_id):
+    """导出本次识别结果为 CSV 表格"""
+    if session_id not in UPLOAD_RESULTS:
+        return jsonify({'error': '会话已过期'}), 400
+    csv_bytes = _build_csv_bytes(UPLOAD_RESULTS[session_id]['results'])
     return send_file(
         io.BytesIO(csv_bytes),
         mimetype='text/csv; charset=utf-8-sig',
         as_attachment=True,
         download_name=f'发票识别结果_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     )
+
+
+# ======================== 批次管理 API ========================
+
+@app.route('/api/batch/add/<session_id>', methods=['POST'])
+def batch_add(session_id):
+    """把一次会话的结果追加到全局批次"""
+    global BATCH_RESULTS, BATCH_SESSION_DIRS
+    if session_id not in UPLOAD_RESULTS:
+        return jsonify({'error': '会话已过期'}), 404
+    session_data = UPLOAD_RESULTS[session_id]
+    with BATCH_LOCK:
+        BATCH_RESULTS.extend(session_data['results'])
+        BATCH_SESSION_DIRS.append(session_data['session_dir'])
+        total   = len(BATCH_RESULTS)
+        success = sum(1 for r in BATCH_RESULTS if r['status'] == 'success')
+    return jsonify({'total': total, 'success': success})
+
+
+@app.route('/api/batch/status', methods=['GET'])
+def batch_status():
+    """返回当前批次累积统计"""
+    with BATCH_LOCK:
+        total   = len(BATCH_RESULTS)
+        success = sum(1 for r in BATCH_RESULTS if r['status'] == 'success')
+    return jsonify({'total': total, 'success': success})
+
+
+@app.route('/api/batch/download', methods=['GET'])
+def batch_download():
+    """下载批次中所有重命名文件的 ZIP"""
+    with BATCH_LOCK:
+        session_dirs = list(BATCH_SESSION_DIRS)
+        results      = list(BATCH_RESULTS)
+    if not results:
+        return jsonify({'error': '批次为空'}), 404
+
+    zip_buf = io.BytesIO()
+    seen: dict = {}
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for sdir in session_dirs:
+            if not os.path.isdir(sdir):
+                continue
+            for fname in os.listdir(sdir):
+                fpath = os.path.join(sdir, fname)
+                arcname = fname
+                if arcname in seen:
+                    seen[arcname] += 1
+                    stem, ext = os.path.splitext(fname)
+                    arcname = f'{stem}_{seen[fname]}{ext}'
+                else:
+                    seen[arcname] = 1
+                zf.write(fpath, arcname)
+    zip_buf.seek(0)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return send_file(zip_buf, mimetype='application/zip',
+                     as_attachment=True,
+                     download_name=f'发票批次_{ts}.zip')
+
+
+@app.route('/api/batch/export', methods=['GET'])
+def batch_export():
+    """导出批次全部结果为 CSV"""
+    with BATCH_LOCK:
+        results = list(BATCH_RESULTS)
+    if not results:
+        return jsonify({'error': '批次为空'}), 404
+    csv_bytes = _build_csv_bytes(results)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return send_file(io.BytesIO(csv_bytes),
+                     mimetype='text/csv; charset=utf-8-sig',
+                     as_attachment=True,
+                     download_name=f'发票批次汇总_{ts}.csv')
+
+
+@app.route('/api/batch/clear', methods=['POST'])
+def batch_clear():
+    """清空全局批次"""
+    global BATCH_RESULTS, BATCH_SESSION_DIRS
+    with BATCH_LOCK:
+        BATCH_RESULTS = []
+        BATCH_SESSION_DIRS = []
+    return jsonify({'message': '批次已清空'})
 
 
 @app.errorhandler(413)
