@@ -274,6 +274,23 @@
             transform: none;
         }
 
+        .btn-export {
+            background: #ed8936;
+            color: white;
+        }
+
+        .btn-export:hover {
+            background: #dd6b20;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(237, 137, 54, 0.3);
+        }
+
+        .btn-export:disabled {
+            background: #cbd5e0;
+            cursor: not-allowed;
+            transform: none;
+        }
+
         .btn-reset {
             background: #f56565;
             color: white;
@@ -421,6 +438,9 @@
                     </button>
                     <button class="btn-download" id="downloadBtn" onclick="downloadResults()">
                         ⬇️ 批量下载
+                    </button>
+                    <button class="btn-export" id="exportBtn" onclick="exportCSV()" disabled>
+                        📊 导出表格
                     </button>
                     <button class="btn-reset" onclick="resetAll()">
                         🔄 重新开始
@@ -615,6 +635,7 @@
 
             resultsSection.classList.add('show');
             document.getElementById('downloadBtn').disabled = successFiles === 0;
+            document.getElementById('exportBtn').disabled = totalFiles === 0;
         }
 
         function downloadResults() {
@@ -632,6 +653,21 @@
             }, 1000);
         }
 
+        function exportCSV() {
+            if (!currentSessionId) return;
+
+            const btn = document.getElementById('exportBtn');
+            btn.disabled = true;
+            showStatus('⏳ 正在生成表格...', 'loading');
+
+            window.location.href = `/api/export/${currentSessionId}`;
+
+            setTimeout(() => {
+                btn.disabled = false;
+                showStatus('✅ 表格已导出！', 'success');
+            }, 1000);
+        }
+
         function resetAll() {
             fileInput.value = '';
             resultsSection.classList.remove('show');
@@ -639,6 +675,7 @@
             document.getElementById('statusMessage').classList.remove('show');
             currentSessionId = null;
             uploadedResults = [];
+            document.getElementById('exportBtn').disabled = true;
             uploadArea.click();
         }
     </script>

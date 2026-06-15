@@ -560,6 +560,57 @@ def download_results(session_id):
     )
 
 
+@app.route('/api/export/<session_id>', methods=['GET'])
+def export_csv(session_id):
+    """导出识别结果为 CSV 表格"""
+    if session_id not in UPLOAD_RESULTS:
+        return jsonify({'error': '会话已过期'}), 400
+
+    results = UPLOAD_RESULTS[session_id]['results']
+
+    import csv
+    output = io.StringIO()
+    # UTF-8 BOM 让 Excel 正确识别中文
+    output.write('\ufeff')
+    writer = csv.writer(output)
+    writer.writerow([
+        '原文件名', '新文件名', '状态',
+        '日期', '发票号码', '购买方', '销售方',
+        '金额（不含税）', '税额', '价税合计', '错误信息'
+    ])
+
+    for item in results:
+        if item['status'] == 'success':
+            d = item.get('data') or {}
+            writer.writerow([
+                item.get('filename', ''),
+                item.get('new_name', ''),
+                '成功',
+                d.get('date', ''),
+                d.get('invoice_number', ''),
+                d.get('buyer', ''),
+                d.get('supplier', ''),
+                d.get('tax_free_amount', ''),
+                d.get('tax_amount', ''),
+                d.get('amount', ''),
+                ''
+            ])
+        else:
+            writer.writerow([
+                item.get('filename', ''), '', '失败',
+                '', '', '', '', '', '', '',
+                item.get('error', '')
+            ])
+
+    csv_bytes = output.getvalue().encode('utf-8-sig')
+    return send_file(
+        io.BytesIO(csv_bytes),
+        mimetype='text/csv; charset=utf-8-sig',
+        as_attachment=True,
+        download_name=f'发票识别结果_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    )
+
+
 @app.errorhandler(413)
 def file_too_large(e):
     return jsonify({'error': '文件过大，最大支持 500MB'}), 413
