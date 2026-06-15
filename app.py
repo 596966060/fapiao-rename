@@ -579,9 +579,18 @@ def export_csv(session_id):
         '金额（不含税）', '税额', '价税合计', '错误信息'
     ])
 
+    total_tax_free = 0.0
+    total_tax = 0.0
+    total_amount = 0.0
+    success_count = 0
+    fail_count = 0
+
     for item in results:
         if item['status'] == 'success':
             d = item.get('data') or {}
+            tax_free = d.get('tax_free_amount', '')
+            tax      = d.get('tax_amount', '')
+            amount   = d.get('amount', '')
             writer.writerow([
                 item.get('filename', ''),
                 item.get('new_name', ''),
@@ -590,17 +599,44 @@ def export_csv(session_id):
                 d.get('invoice_number', ''),
                 d.get('buyer', ''),
                 d.get('supplier', ''),
-                d.get('tax_free_amount', ''),
-                d.get('tax_amount', ''),
-                d.get('amount', ''),
+                tax_free,
+                tax,
+                amount,
                 ''
             ])
+            try:
+                total_tax_free += float(tax_free) if tax_free else 0
+            except ValueError:
+                pass
+            try:
+                total_tax += float(tax) if tax else 0
+            except ValueError:
+                pass
+            try:
+                total_amount += float(amount) if amount else 0
+            except ValueError:
+                pass
+            success_count += 1
         else:
             writer.writerow([
                 item.get('filename', ''), '', '失败',
                 '', '', '', '', '', '', '',
                 item.get('error', '')
             ])
+            fail_count += 1
+
+    # 空白分隔行
+    writer.writerow([])
+    # 汇总行
+    writer.writerow([
+        f'合计（成功 {success_count} 张，失败 {fail_count} 张）',
+        '', '',
+        '', '', '', '',
+        f'{total_tax_free:.2f}',
+        f'{total_tax:.2f}',
+        f'{total_amount:.2f}',
+        ''
+    ])
 
     csv_bytes = output.getvalue().encode('utf-8-sig')
     return send_file(
