@@ -197,64 +197,113 @@ class InvoiceExtractor:
                     break
 
         # === 购买方和销售方 ===
-        # 策略1: 明确的购买方/销售方标签
-        buyer_match = re.search(
-            r'(?:购买方|购\s*方|买\s*方)[^\n]*?(?:[1l名]称|称)[：:]\s*([^\n]+)', text)
-        supplier_match = re.search(
-            r'(?:销售方|销\s*方|卖\s*方)[^\n]*?(?:[1l名]称|称)[：:]\s*([^\n]+)', text)
-
         def clean_company(name):
-            """清理公司名，要求包含中文字符"""
+            """清理公司名：截断噪音、校验合法性"""
+            if not name:
+                return None
             name = name.strip()
-            # 去掉税号、数字串等杂质
-            name = re.sub(r'\s+\d{10,}.*$', '', name)
-            name = name.strip()
-            # 必须包含中文字符才算有效公司名
+            # 同行存在另一方标签时截断（如 "A公司 销售方名称: B公司"）
+            name = re.split(r'(?:销售方|购买方)\s*名称', name)[0]
+            # 截断在纳税人/地址/开户/电话等发票字段标签处
+            name = re.split(r'(?:纳税人|识别号|地址[、，,]|开户|电话|统一社会)', name)[0]
+            # 去掉末尾长数字串（税号等）
+            name = re.sub(r'\s*\d{8,}.*$', '', name)
+            # 去掉末尾标点/空白
+            name = re.sub(r'[：:\s，,。.]+$', '', name).strip()
+            # 必须含中文
             if not re.search(r'[\u4e00-\u9fa5]', name):
                 return None
-            if len(name) < 3 or len(name) > 60:
+            if len(name) < 2 or len(name) > 60:
                 return None
             return name
 
-        if buyer_match:
-            result["buyer"] = clean_company(buyer_match.group(1))
-        if supplier_match:
-            result["supplier"] = clean_company(supplier_match.group(1))
+        # 策略0: 同行双名称（OCR 将两列合并到一行，如 "名称: A公司  名称: B公司"）
+        same_line_both = re.search(
+            r'[1l名]称[：:]\s*(.+?)\s{2,}[1l名]称[：:]\s*([^\n]+)', text)
 
-        # 策略2: 如果明确标签没找到，找所有 "名称:" / "1称:" / "l称:" 后面的内容
-        if not result["buyer"] and not result["supplier"]:
+        # 策略0b: "购买方名称: A公司 销售方名称: B公司" 同行完整格式
+        explicit_both = re.search(
+            r'购买方\s*名称[：:]\s*(.+?)\s+销售方\s*名称[：:]\s*([^\n]+)', text)
+
+        # 策略1: 购买方——多模式，允许标签和名称之间有换行
+        _buyer_pats = [
+            r'购买方\s*名称[：:]\s*([^\n]+)',
+            r'购\s*买\s*方[^\n]{0,8}\n[^\n]{0,5}名称[：:]\s*([^\n]+)',
+            r'(?:购买方|购\s*方|买\s*方)[^\n]{0,30}?[1l名]称[：:]\s*([^\n]+)',
+        ]
+        buyer_raw = None
+        for p in _buyer_pats:
+            m = re.search(p, text, re.MULTILINE)
+            if m:
+                buyer_raw = m.group(1)
+                break
+
+        # 策略1: 销售方——多模式，允许标签和名称之间有换行
+        _supplier_pats = [
+            r'销售方\s*名称[：:]\s*([^\n]+)',
+            r'销\s*售\s*方[^\n]{0,8}\n[^\n]{0,5}名称[：:]\s*([^\n]+)',
+            r'(?:销售方|销\s*方|卖\s*方)[^\n]{0,30}?[1l名]称[：:]\s*([^\n]+)',
+            # 兜底：识别"销"后跟任意空白再跟名称
+            r'销[^\n]{0,20}?名称[：:]\s*([^\n]+)',
+        ]
+        supplier_raw = None
+        for p in _supplier_pats:
+            m = re.search(p, text, re.MULTILINE)
+            if m:
+                supplier_raw = m.group(1)
+                break
+
+        # 优先级：explicit_both > 策略1个别匹配 > same_line_both
+        if explicit_both:
+            if not buyer_raw:
+                buyer_raw = explicit_both.group(1)
+            if not supplier_raw:
+                supplier_raw = explicit_both.group(2)
+
+        if buyer_raw:
+            result["buyer"] = clean_company(buyer_raw)
+        if supplier_raw:
+            result["supplier"] = clean_company(supplier_raw)
+
+        # 策略0回填（同行双名称）
+        if same_line_both and (not result["buyer"] or not result["supplier"]):
+            b = clean_company(same_line_both.group(1))
+            s = clean_company(same_line_both.group(2))
+            if b and not result["buyer"]:
+                result["buyer"] = b
+            if s and not result["supplier"]:
+                result["supplier"] = s
+
+        # 策略2: 按出现顺序收集所有 "名称:" 内容，补全缺失的一方
+        # （条件修正为 OR：任意一方缺失就运行）
+        if not result["buyer"] or not result["supplier"]:
             company_lines = []
-            label_patterns = [
-                r'[1l]称[：:]\s*([^\n]+)',
-                r'名称[：:]\s*([^\n]+)',
-            ]
-            for pattern in label_patterns:
-                for m in re.findall(pattern, text):
+            for pat in (r'[1l名]称[：:]\s*([^\n]+)', r'名称[：:]\s*([^\n]+)'):
+                for m in re.findall(pat, text):
                     c = clean_company(m)
-                    if c:
+                    if c and c not in company_lines:
+                        company_lines.append(c)
+                if company_lines:
+                    break
+
+            # 策略3: 通用企业词尾识别
+            if len(company_lines) < 2:
+                for m in re.findall(
+                    r'[\u4e00-\u9fa5]{2,}(?:公司|有限|分公司|集团|股份|企业|'
+                    r'研究所|医院|学校|协会|中心|局|院|所|厂|部)', text
+                ):
+                    c = clean_company(m)
+                    if c and c not in company_lines:
                         company_lines.append(c)
 
-            # 策略3: 通用企业名识别（要求包含中文 + 企业词尾）
-            if not company_lines:
-                company_pattern = r'[\u4e00-\u9fa5]{2,}(?:公司|有限|分公司|集团|股份|企业|研究所|医院|学校|协会|中心)'
-                for m in re.findall(company_pattern, text):
-                    c = clean_company(m)
-                    if c:
-                        company_lines.append(c)
-
-            # 去重
-            seen = set()
-            unique_companies = []
-            for c in company_lines:
-                if c not in seen:
-                    seen.add(c)
-                    unique_companies.append(c)
-
-            if len(unique_companies) >= 2:
-                result["buyer"] = unique_companies[0]
-                result["supplier"] = unique_companies[1]
-            elif len(unique_companies) == 1:
-                result["buyer"] = unique_companies[0]
+            if not result["buyer"] and len(company_lines) >= 1:
+                result["buyer"] = company_lines[0]
+            if not result["supplier"]:
+                buyer_val = result.get("buyer")
+                for c in company_lines:
+                    if c != buyer_val:
+                        result["supplier"] = c
+                        break
 
         def _find_amount(patterns, text):
             """通用金额提取，返回匹配到的第一个有效金额字符串"""
