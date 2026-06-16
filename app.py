@@ -551,15 +551,20 @@ class TrainTicketExtractor:
                 result['train_number'] = m.group(1)
 
         # === 日期 ===
-        # 电子客票有"乘车日期"/"出发日期"标签，优先匹配
+        # 注意：铁路电子客票有"乘车日期"（乘车日）和"开票日期"（开票日），取乘车日期
+        # 先把"开票日期"这行从文本中临时遮掉，避免误匹配
+        text_no_invoice_date = re.sub(r'开\s*票\s*日\s*期[：:\s]*\d{4}年\d{1,2}月\d{1,2}日', '', text)
         date_pats = [
+            # 优先：有明确标签的乘车/出发日期
             (r'(?:乘车日期|出发日期|乘\s*车\s*日)[：:\s]*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', 2, 3, 4),
+            # 次选：任意"XXXX年XX月XX日"（已排除开票日期行）
             (r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', 1, 2, 3),
+            # ISO 格式
             (r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', 1, 2, 3),
-            (r'(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)', 1, 2, 3),
         ]
         for pat, gi, gm, gd in date_pats:
-            m = re.search(pat, text)
+            src = text if gi == 2 else text_no_invoice_date  # 有标签时用全文，否则用遮掉版本
+            m = re.search(pat, src)
             if m:
                 try:
                     y, mo, d = int(m.group(gi)), int(m.group(gm)), int(m.group(gd))
@@ -578,61 +583,7 @@ class TrainTicketExtractor:
             if tm:
                 result['depart_time'] = tm.group(0)[:5]
 
-        # === 出发站 / 到达站 ===
-        # 策略1：明确标签（兼容"始发站/终到站"电子客票格式和"出发站/到达站"格式）
-        # 修复：用 [^\n]{2,12} 捕获，再用 _clean_station 过滤
-        _label_from = re.search(
-            r'(?:出\s*发\s*站|始\s*发\s*站)[：:\s]*([\u4e00-\u9fa5]{2,12})', text)
-        _label_to   = re.search(
-            r'(?:到\s*达\s*站|终\s*到\s*站|目\s*的\s*地)[：:\s]*([\u4e00-\u9fa5]{2,12})', text)
-        if _label_from:
-            s = self._clean_station(_label_from.group(1))
-            if s: result['from_station'] = s
-        if _label_to:
-            s = self._clean_station(_label_to.group(1))
-            if s: result['to_station'] = s
-
-        # 策略2：箭头/横线分隔（最常见：上海虹桥→北京南）
-        # 修复：字符集加入更多 OCR 可能输出的箭头符号
-        if not result['from_station'] or not result['to_station']:
-            arrow = re.search(
-                r'([\u4e00-\u9fa5]{2,10}(?:站)?)\s*[→➜>\-—至]\s*([\u4e00-\u9fa5]{2,10}(?:站)?)',
-                text)
-            if arrow:
-                f = self._clean_station(arrow.group(1))
-                t = self._clean_station(arrow.group(2))
-                if f and not result['from_station']: result['from_station'] = f
-                if t and not result['to_station']:   result['to_station']   = t
-
-        # 策略3：带方位词后缀的站名（南/北/东/西/虹桥/高铁 + 可选"站"）
-        # 修复：先排除"出发站/到达站"等元词，再过滤黑名单
-        if not result['from_station'] or not result['to_station']:
-            station_candidates = re.findall(
-                r'([\u4e00-\u9fa5]{2,8}(?:南|北|东|西|虹桥|高铁|北站|南站|东站|西站)(?:站)?)',
-                text)
-            clean_cands = []
-            for sc in station_candidates:
-                s = self._clean_station(sc)
-                if s and s not in clean_cands:
-                    clean_cands.append(s)
-            if not result['from_station'] and len(clean_cands) >= 1:
-                result['from_station'] = clean_cands[0]
-            if not result['to_station'] and len(clean_cands) >= 2:
-                result['to_station'] = clean_cands[1]
-
-        # 策略4：带"站"字后缀的任意站名（兜底）
-        if not result['from_station'] or not result['to_station']:
-            with_zhan = [
-                self._clean_station(s)
-                for s in re.findall(r'([\u4e00-\u9fa5]{2,8}站)', text)
-            ]
-            with_zhan = [s for s in with_zhan if s]
-            if not result['from_station'] and len(with_zhan) >= 1:
-                result['from_station'] = with_zhan[0]
-            if not result['to_station'] and len(with_zhan) >= 2:
-                result['to_station'] = with_zhan[1]
-
-        # === 乘客姓名 ===
+        # === 乘客姓名（先提取，用于后续站名过滤）===
         _NAME_BLACKLIST = {
             '出发', '到达', '乘坐', '车次', '购票', '旅客', '列车', '中国',
             '铁路', '上海', '北京', '广州', '深圳', '成都', '武汉', '南京',
@@ -647,6 +598,10 @@ class TrainTicketExtractor:
             r'([\u4e00-\u9fa5]{2,4})\s*\d{15,18}[Xx]?',
             # 隐码身份证前（含 * 星号遮盖）
             r'([\u4e00-\u9fa5]{2,4})\s*\*{4,}',
+            # 铁路电子客票：隐码ID（****5127）后换行即为姓名
+            r'\*{4,}\d+\n([\u4e00-\u9fa5]{2,4})',
+            # 隐码ID或长数字串后换行（更宽松兜底）
+            r'(?:\*{4,}|\d{6,})[^\n]*\n([\u4e00-\u9fa5]{2,4})\n',
             # 姓名出现在座位类型之前（如 "张三 二等座"）
             r'([\u4e00-\u9fa5]{2,4})\s+(?:商务座|特等座|一等座|二等座|软卧|硬卧|硬座|无座)',
             # 姓名出现在票价/¥ 之前（如 "张三 ¥553.50"）
@@ -659,6 +614,65 @@ class TrainTicketExtractor:
                 if name not in _NAME_BLACKLIST:
                     result['passenger_name'] = name
                     break
+
+        # 站名过滤时动态排除已识别的乘客姓名，防止人名末字含方位词被误判为站名
+        _station_extra_excl = set()
+        if result['passenger_name']:
+            _station_extra_excl.add(result['passenger_name'])
+
+        def _clean_st(name: str) -> str:
+            s = self._clean_station(name)
+            return '' if s in _station_extra_excl else s
+
+        # === 出发站 / 到达站 ===
+        # 策略1：明确标签（兼容"始发站/终到站"电子客票格式和"出发站/到达站"格式）
+        _label_from = re.search(
+            r'(?:出\s*发\s*站|始\s*发\s*站)[：:\s]*([\u4e00-\u9fa5]{2,12})', text)
+        _label_to   = re.search(
+            r'(?:到\s*达\s*站|终\s*到\s*站|目\s*的\s*地)[：:\s]*([\u4e00-\u9fa5]{2,12})', text)
+        if _label_from:
+            s = _clean_st(_label_from.group(1))
+            if s: result['from_station'] = s
+        if _label_to:
+            s = _clean_st(_label_to.group(1))
+            if s: result['to_station'] = s
+
+        # 策略2：箭头/横线分隔（最常见：上海虹桥→北京南）
+        if not result['from_station'] or not result['to_station']:
+            arrow = re.search(
+                r'([\u4e00-\u9fa5]{2,10}(?:站)?)\s*[→➜>\-—至]\s*([\u4e00-\u9fa5]{2,10}(?:站)?)',
+                text)
+            if arrow:
+                f = _clean_st(arrow.group(1))
+                t = _clean_st(arrow.group(2))
+                if f and not result['from_station']: result['from_station'] = f
+                if t and not result['to_station']:   result['to_station']   = t
+
+        # 策略3：带复合方位词后缀（东站/西站/南站/北站/虹桥/高铁）
+        # 注意：单字方位词（东/西/南/北）需要 >=4 字总长，防止"梁立东"之类的误匹配
+        if not result['from_station'] or not result['to_station']:
+            station_candidates = re.findall(
+                r'([\u4e00-\u9fa5]{2,8}(?:虹桥|高铁|北站|南站|东站|西站)(?:站)?'
+                r'|[\u4e00-\u9fa5]{4,8}(?:南|北|东|西)(?:站)?)',
+                text)
+            clean_cands = []
+            for sc in station_candidates:
+                s = _clean_st(sc)
+                if s and s not in clean_cands:
+                    clean_cands.append(s)
+            if not result['from_station'] and len(clean_cands) >= 1:
+                result['from_station'] = clean_cands[0]
+            if not result['to_station'] and len(clean_cands) >= 2:
+                result['to_station'] = clean_cands[1]
+
+        # 策略4：带"站"字后缀的任意站名（兜底）
+        if not result['from_station'] or not result['to_station']:
+            with_zhan = [_clean_st(s) for s in re.findall(r'([\u4e00-\u9fa5]{2,8}站)', text)]
+            with_zhan = [s for s in with_zhan if s]
+            if not result['from_station'] and len(with_zhan) >= 1:
+                result['from_station'] = with_zhan[0]
+            if not result['to_station'] and len(with_zhan) >= 2:
+                result['to_station'] = with_zhan[1]
 
         # === 座位类型 ===
         for st in self._SEAT_TYPES:
@@ -758,28 +772,57 @@ def status():
     })
 
 
+def _pdf_direct_text(pdf_path: str) -> str | None:
+    """用 PyMuPDF 直接提取矢量 PDF 文本（电子发票/电子客票专用）。
+    若提取到足够中文字符（>=10），返回按行合并的文本；否则返回 None 让调用方退回 OCR。"""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        lines = []
+        for page in doc:
+            for line in page.get_text().splitlines():
+                line = line.strip()
+                if line:
+                    lines.append(line)
+        doc.close()
+        full = '\n'.join(lines)
+        cn_chars = sum(1 for c in full if '\u4e00' <= c <= '\u9fa5')
+        return full if cn_chars >= 10 else None
+    except Exception:
+        return None
+
+
 def smart_extract(file_path: str, reader) -> tuple:
-    """OCR 一次，自动判断发票或火车票，返回 (data_dict, doc_type)"""
-    inv  = InvoiceExtractor(reader)
+    """自动判断发票或火车票，返回 (data_dict, doc_type)。
+    PDF 优先用 PyMuPDF 直提矢量文本（精度远高于 OCR），OCR 仅作扫描图兜底。"""
+    inv   = InvoiceExtractor(reader)
     train = TrainTicketExtractor(reader)
 
     fp  = Path(file_path)
     ext = fp.suffix.lower()
 
+    text = None  # 最终用于字段提取的文本
+
+    # === 1. 矢量 PDF 优先直提文本 ===
     if ext == '.pdf':
-        img = inv._pdf_to_image(str(fp))
-    else:
-        img = inv._image_file_to_array(str(fp))
+        text = _pdf_direct_text(str(fp))
 
-    if img is None or img.size == 0:
-        raise Exception("无法读取图像")
+    # === 2. 无法直提 / 非 PDF → OCR ===
+    if not text:
+        if ext == '.pdf':
+            img = inv._pdf_to_image(str(fp))
+        else:
+            img = inv._image_file_to_array(str(fp))
 
-    img     = inv._preprocess_image(img)
-    results = reader.readtext(img, detail=0)
-    if not results:
-        raise Exception("OCR 无法识别")
+        if img is None or img.size == 0:
+            raise Exception("无法读取图像")
 
-    text     = '\n'.join(results)
+        img     = inv._preprocess_image(img)
+        results = reader.readtext(img, detail=0)
+        if not results:
+            raise Exception("OCR 无法识别")
+        text = '\n'.join(results)
+
     doc_type = detect_doc_type(text)
 
     if doc_type == 'train':
