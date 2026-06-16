@@ -435,9 +435,12 @@ def generate_train_filename(data: dict, original_ext: str) -> str:
 _TRAIN_KEYWORDS = re.compile(
     r'车\s*次|检\s*票|候\s*车|动\s*车|高\s*铁|火\s*车\s*票|硬\s*卧|软\s*卧|硬\s*座|'
     r'二\s*等\s*座|一\s*等\s*座|商\s*务\s*座|无\s*座|出\s*发\s*站|到\s*达\s*站|'
-    r'网络购票|铁路电子客票|中国铁路|12306|票价[：:\s]*[¥￥]?\d'
+    r'网络购票|铁路电子客票|中国铁路|12306|票价[：:\s]*[¥￥]?\d|'
+    r'列\s*车\s*号|乘\s*车\s*日|席\s*别|始\s*发\s*站|终\s*到\s*站|补\s*票|'
+    r'开\s*车\s*时\s*间|出\s*发\s*时\s*间|铁\s*路\s*客\s*票'
 )
-_TRAIN_NUMBER_RE = re.compile(r'\b([GDTZKCY]\d{1,4})\b')
+# 修复：去掉 \b，在中文环境下 \b 不能正确匹配（中文字符属于 \w，无法形成边界）
+_TRAIN_NUMBER_RE = re.compile(r'(?<![A-Z\d])([GDTZKCY]\d{1,4})(?!\d)')
 
 
 def detect_doc_type(text: str) -> str:
@@ -507,26 +510,50 @@ class TrainTicketExtractor:
         fields['_raw_text'] = text
         return fields
 
+    # 不应被识别为站名的元词
+    _STATION_BLACKLIST = re.compile(
+        r'^(?:出发站|到达站|始发站|终到站|目的地|经由|中转|检票口|候车|开车)$')
+
+    def _clean_station(self, name: str) -> str:
+        """清理站名：去掉"站"后缀、过滤黑名单词"""
+        name = name.strip()
+        # 过滤黑名单元词
+        if self._STATION_BLACKLIST.match(name):
+            return ''
+        # 去掉末尾的"站"（保留内嵌的，如"北站"本身不去）
+        if name.endswith('站') and len(name) > 2:
+            name = name[:-1]
+        return name
+
     def _extract_fields(self, text: str, stem: str = '') -> dict:
         result = {
-            'date': None,
-            'train_number': None,
-            'from_station': None,
-            'to_station': None,
+            'date':           None,
+            'train_number':   None,
+            'from_station':   None,
+            'to_station':     None,
             'passenger_name': None,
-            'seat': None,
-            'seat_type': None,
-            'price': None,
-            'depart_time': None,
+            'seat':           None,
+            'seat_type':      None,
+            'price':          None,
+            'depart_time':    None,
         }
 
         # === 车次 ===
-        m = _TRAIN_NUMBER_RE.search(text)
-        if m:
-            result['train_number'] = m.group(1)
+        # 优先：有标签（车次:/列车号:）
+        tn_labeled = re.search(
+            r'(?:车\s*次|列\s*车\s*号)[：:\s]*([GDTZKCY]\d{1,4})', text)
+        if tn_labeled:
+            result['train_number'] = tn_labeled.group(1)
+        else:
+            # 修复了的正则（去掉 \b，用显式边界）
+            m = _TRAIN_NUMBER_RE.search(text)
+            if m:
+                result['train_number'] = m.group(1)
 
         # === 日期 ===
+        # 电子客票有"乘车日期"/"出发日期"标签，优先匹配
         date_pats = [
+            (r'(?:乘车日期|出发日期|乘\s*车\s*日)[：:\s]*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', 2, 3, 4),
             (r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', 1, 2, 3),
             (r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', 1, 2, 3),
             (r'(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)', 1, 2, 3),
@@ -539,90 +566,152 @@ class TrainTicketExtractor:
                     if 1900 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
                         result['date'] = f'{y:04d}-{mo:02d}-{d:02d}'
                         break
-                except:
+                except Exception:
                     pass
 
         # === 出发时间 ===
-        m = re.search(r'(\d{2}):(\d{2})(?::(\d{2}))?', text)
-        if m:
-            result['depart_time'] = m.group(0)[:5]
+        tm = re.search(r'(?:出发时间|开车时间|发车)[：:\s]*(\d{1,2}:\d{2})', text)
+        if tm:
+            result['depart_time'] = tm.group(1)
+        else:
+            tm = re.search(r'(\d{2}):(\d{2})(?::(\d{2}))?', text)
+            if tm:
+                result['depart_time'] = tm.group(0)[:5]
 
         # === 出发站 / 到达站 ===
-        # 优先：标签法
-        from_m = re.search(r'(?:出发站|始发站)[：:\s]*([^\n\s→\-]{2,8})', text)
-        to_m   = re.search(r'(?:到达站|终到站|目的地)[：:\s]*([^\n\s→\-]{2,8})', text)
-        if from_m:
-            result['from_station'] = from_m.group(1).strip()
-        if to_m:
-            result['to_station'] = to_m.group(1).strip()
+        # 策略1：明确标签（兼容"始发站/终到站"电子客票格式和"出发站/到达站"格式）
+        # 修复：用 [^\n]{2,12} 捕获，再用 _clean_station 过滤
+        _label_from = re.search(
+            r'(?:出\s*发\s*站|始\s*发\s*站)[：:\s]*([\u4e00-\u9fa5]{2,12})', text)
+        _label_to   = re.search(
+            r'(?:到\s*达\s*站|终\s*到\s*站|目\s*的\s*地)[：:\s]*([\u4e00-\u9fa5]{2,12})', text)
+        if _label_from:
+            s = self._clean_station(_label_from.group(1))
+            if s: result['from_station'] = s
+        if _label_to:
+            s = self._clean_station(_label_to.group(1))
+            if s: result['to_station'] = s
 
-        # 备用：箭头/横线分隔  上海虹桥→北京南  或  上海虹桥-北京南
+        # 策略2：箭头/横线分隔（最常见：上海虹桥→北京南）
+        # 修复：字符集加入更多 OCR 可能输出的箭头符号
         if not result['from_station'] or not result['to_station']:
             arrow = re.search(
-                r'([\u4e00-\u9fa5]{2,8}(?:站)?)\s*[→\-\—]\s*([\u4e00-\u9fa5]{2,8}(?:站)?)',
+                r'([\u4e00-\u9fa5]{2,10}(?:站)?)\s*[→➜>\-—至]\s*([\u4e00-\u9fa5]{2,10}(?:站)?)',
                 text)
             if arrow:
-                result.setdefault('from_station', arrow.group(1).strip()) or \
-                    result.update({'from_station': arrow.group(1).strip()})
-                result.setdefault('to_station', arrow.group(2).strip()) or \
-                    result.update({'to_station': arrow.group(2).strip()})
-                if not result['from_station']:
-                    result['from_station'] = arrow.group(1).strip()
-                if not result['to_station']:
-                    result['to_station'] = arrow.group(2).strip()
+                f = self._clean_station(arrow.group(1))
+                t = self._clean_station(arrow.group(2))
+                if f and not result['from_station']: result['from_station'] = f
+                if t and not result['to_station']:   result['to_station']   = t
 
-        # 备用：连续中文（X站 Y站）
+        # 策略3：带方位词后缀的站名（南/北/东/西/虹桥/高铁 + 可选"站"）
+        # 修复：先排除"出发站/到达站"等元词，再过滤黑名单
         if not result['from_station'] or not result['to_station']:
-            stations = re.findall(r'([\u4e00-\u9fa5]{2,8}站)', text)
-            if len(stations) >= 2 and not result['from_station']:
-                result['from_station'] = stations[0].rstrip('站') if stations[0].endswith('站') else stations[0]
-                result['to_station']   = stations[1].rstrip('站') if stations[1].endswith('站') else stations[1]
-            elif len(stations) == 1 and not result['from_station']:
-                result['from_station'] = stations[0].rstrip('站')
+            station_candidates = re.findall(
+                r'([\u4e00-\u9fa5]{2,8}(?:南|北|东|西|虹桥|高铁|北站|南站|东站|西站)(?:站)?)',
+                text)
+            clean_cands = []
+            for sc in station_candidates:
+                s = self._clean_station(sc)
+                if s and s not in clean_cands:
+                    clean_cands.append(s)
+            if not result['from_station'] and len(clean_cands) >= 1:
+                result['from_station'] = clean_cands[0]
+            if not result['to_station'] and len(clean_cands) >= 2:
+                result['to_station'] = clean_cands[1]
+
+        # 策略4：带"站"字后缀的任意站名（兜底）
+        if not result['from_station'] or not result['to_station']:
+            with_zhan = [
+                self._clean_station(s)
+                for s in re.findall(r'([\u4e00-\u9fa5]{2,8}站)', text)
+            ]
+            with_zhan = [s for s in with_zhan if s]
+            if not result['from_station'] and len(with_zhan) >= 1:
+                result['from_station'] = with_zhan[0]
+            if not result['to_station'] and len(with_zhan) >= 2:
+                result['to_station'] = with_zhan[1]
 
         # === 乘客姓名 ===
-        name_m = re.search(r'(?:姓\s*名|旅\s*客)[：:\s]*([\u4e00-\u9fa5]{2,4})', text)
-        if name_m:
-            result['passenger_name'] = name_m.group(1)
-        else:
-            # 备用：身份证号前面通常是姓名（2-4个中文字）
-            id_m = re.search(r'([\u4e00-\u9fa5]{2,4})\s*\d{15,18}', text)
-            if id_m:
-                result['passenger_name'] = id_m.group(1)
+        _NAME_BLACKLIST = {
+            '出发', '到达', '乘坐', '车次', '购票', '旅客', '列车', '中国',
+            '铁路', '上海', '北京', '广州', '深圳', '成都', '武汉', '南京',
+            '高铁', '动车', '候车', '检票', '开车', '席别', '座位', '票价',
+        }
+        name_pats = [
+            # 有标签
+            r'(?:姓\s*名|旅\s*客|购\s*票\s*人|乘\s*客)[：:\s]*([\u4e00-\u9fa5]{2,4})',
+            # 身份证/护照关键字前
+            r'([\u4e00-\u9fa5]{2,4})[（\(]?(?:居民身份证|身份证|护照)',
+            # 身份证号码前（全数字 15-18 位）
+            r'([\u4e00-\u9fa5]{2,4})\s*\d{15,18}[Xx]?',
+            # 隐码身份证前（含 * 星号遮盖）
+            r'([\u4e00-\u9fa5]{2,4})\s*\*{4,}',
+            # 姓名出现在座位类型之前（如 "张三 二等座"）
+            r'([\u4e00-\u9fa5]{2,4})\s+(?:商务座|特等座|一等座|二等座|软卧|硬卧|硬座|无座)',
+            # 姓名出现在票价/¥ 之前（如 "张三 ¥553.50"）
+            r'([\u4e00-\u9fa5]{2,4})\s*[¥￥]\s*\d',
+        ]
+        for p in name_pats:
+            nm = re.search(p, text)
+            if nm:
+                name = nm.group(1).strip()
+                if name not in _NAME_BLACKLIST:
+                    result['passenger_name'] = name
+                    break
 
         # === 座位类型 ===
         for st in self._SEAT_TYPES:
             if st in text:
                 result['seat_type'] = st
                 break
+        # 电子客票"席别"标签
+        if not result['seat_type']:
+            xi = re.search(r'席\s*别[：:\s]*([\u4e00-\u9fa5]{2,5})', text)
+            if xi:
+                result['seat_type'] = xi.group(1)
 
         # === 座位号 ===
-        seat_m = re.search(r'(\d{1,2}\s*车\s*\d{1,2}[A-F号]?)', text)
-        if seat_m:
-            result['seat'] = seat_m.group(1).strip()
+        seat_pats = [
+            r'(\d{1,2}\s*车\s*\d{1,2}\s*[A-F号])',   # 08车06A号
+            r'([A-F]\d\s*车厢?\s*\d{1,2}\s*号?)',      # A3车厢6号
+            r'(\d{1,2}[A-F]\d?)',                      # 紧凑格式 06A
+        ]
+        for sp in seat_pats:
+            sm = re.search(sp, text)
+            if sm:
+                result['seat'] = sm.group(1).strip()
+                break
 
         # === 票价 ===
-        # 优先：票价标签
-        price_m = re.search(r'(?:票\s*价|价\s*格|金\s*额)[：:\s]*[¥￥]?\s*(\d+\.?\d*)', text)
-        if price_m:
-            result['price'] = f"{float(price_m.group(1)):.2f}"
-        else:
-            # 备用：¥ + 数字
-            price_m = re.search(r'[¥￥]\s*(\d+\.?\d*)', text)
-            if price_m:
-                result['price'] = f"{float(price_m.group(1)):.2f}"
-            else:
-                # 备用：文中最大 x.x 小数（票价通常是最大金额）
-                decimals = [float(x) for x in re.findall(r'\b(\d{1,5}\.\d{1,2})\b', text)]
-                if decimals:
-                    result['price'] = f"{max(decimals):.2f}"
+        price_pats = [
+            r'(?:票\s*价|价\s*格|金\s*额|票\s*款)[：:\s]*[¥￥]?\s*(\d+\.?\d*)',
+            r'[¥￥]\s*(\d+\.?\d*)',
+            r'(\d{2,5}\.\d{1,2})\s*元',
+            r'合\s*计[：:\s]*[¥￥]?\s*(\d+\.?\d*)',
+        ]
+        for pp in price_pats:
+            pm = re.search(pp, text)
+            if pm:
+                try:
+                    result['price'] = f"{float(pm.group(1)):.2f}"
+                    break
+                except ValueError:
+                    pass
+        # 兜底：文中最大小数
+        if not result['price']:
+            decimals = [float(x) for x in re.findall(r'(?<!\d)(\d{1,5}\.\d{1,2})(?!\d)', text)
+                        if 1 <= float(x) <= 10000]
+            if decimals:
+                result['price'] = f"{max(decimals):.2f}"
 
-        # === 从文件名补充 ===
-        parts = stem.split('_')
-        for part in parts:
-            tn = _TRAIN_NUMBER_RE.match(part)
-            if tn and not result['train_number']:
-                result['train_number'] = tn.group(1)
+        # === 从文件名补充缺失字段 ===
+        if stem:
+            parts = re.split(r'[_\-\s]', stem)
+            for part in parts:
+                tn = re.match(r'^([GDTZKCY]\d{1,4})$', part)
+                if tn and not result['train_number']:
+                    result['train_number'] = tn.group(1)
 
         return result
 
