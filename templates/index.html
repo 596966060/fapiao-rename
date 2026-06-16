@@ -161,10 +161,16 @@
         }
 
         .file-new-name {
-            color: #667eea;
-            font-family: monospace;
-            font-size: 12px;
-            margin-bottom: 8px;
+            background: linear-gradient(90deg, #c6f6d5 0%, #e6fffa 100%);
+            border-left: 3px solid #38a169;
+            padding: 7px 12px;
+            border-radius: 5px;
+            color: #22543d;
+            font-family: 'Courier New', monospace;
+            font-size: 12.5px;
+            font-weight: 600;
+            margin-bottom: 10px;
+            word-break: break-all;
         }
 
         .file-fields {
@@ -538,6 +544,46 @@
         }
         .btn-cancel:hover { color: #e53e3e; border-color: #e53e3e; }
 
+        /* ---- 火车票路线条 ---- */
+        .train-route-bar {
+            display: flex;
+            align-items: center;
+            background: linear-gradient(90deg, #ebf4ff 0%, #e6fffa 100%);
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-bottom: 10px;
+            gap: 8px;
+        }
+        .route-station {
+            flex: 1;
+            font-size: 15px;
+            font-weight: 700;
+            color: #2b6cb0;
+            text-align: center;
+        }
+        .route-station.to { color: #276749; }
+        .route-mid {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1px;
+            flex-shrink: 0;
+        }
+        .route-train-no {
+            font-size: 11px;
+            font-weight: 700;
+            color: #5a67d8;
+            background: white;
+            border-radius: 10px;
+            padding: 1px 8px;
+            border: 1px solid #c3dafe;
+        }
+        .route-arrow-line {
+            font-size: 18px;
+            color: #4299e1;
+            line-height: 1;
+        }
+
         @media (max-width: 600px) {
             .card {
                 padding: 20px;
@@ -782,12 +828,21 @@
 
                     // 字段展示区
                     const fieldsHtml = isTrain ? `
-                        <div class="field"><span class="field-label">车次:</span> <span id="v-train-${idx}">${d.train_number || '-'}</span></div>
-                        <div class="field"><span class="field-label">出发→到达:</span> <span id="v-route-${idx}">${(d.from_station||'?')} → ${(d.to_station||'?')}</span></div>
-                        <div class="field"><span class="field-label">日期:</span> <span id="v-date-${idx}">${d.date || '-'}</span></div>
-                        <div class="field"><span class="field-label">乘客:</span> <span id="v-name-${idx}">${d.passenger_name || '-'}</span></div>
-                        <div class="field"><span class="field-label">座位:</span> <span id="v-seat-${idx}">${d.seat || '-'} ${d.seat_type ? '(' + d.seat_type + ')' : ''}</span></div>
-                        <div class="field"><span class="field-label">票价:</span> <span id="v-price-${idx}">${d.price ? d.price + ' 元' : '-'}</span></div>
+                        <div class="train-route-bar">
+                            <span class="route-station from" id="v-from-${idx}">${d.from_station || '?'}</span>
+                            <div class="route-mid">
+                                <span class="route-train-no" id="v-train-${idx}">${d.train_number || '-'}</span>
+                                <span class="route-arrow-line">→</span>
+                            </div>
+                            <span class="route-station to" id="v-to-${idx}">${d.to_station || '?'}</span>
+                        </div>
+                        <div class="file-fields">
+                            <div class="field"><span class="field-label">日期:</span> <span id="v-date-${idx}">${d.date || '-'}</span></div>
+                            <div class="field"><span class="field-label">出发时间:</span> <span id="v-dtime-${idx}">${d.depart_time || '-'}</span></div>
+                            <div class="field"><span class="field-label">乘客:</span> <span id="v-name-${idx}">${d.passenger_name || '-'}</span></div>
+                            <div class="field"><span class="field-label">座位:</span> <span id="v-seat-${idx}">${d.seat || '-'}${d.seat_type ? ' (' + d.seat_type + ')' : ''}</span></div>
+                            <div class="field"><span class="field-label">票价:</span> <span id="v-price-${idx}">${d.price ? d.price + ' 元' : '-'}</span></div>
+                        </div>
                     ` : `
                         <div class="field"><span class="field-label">日期:</span> <span id="v-date-${idx}">${d.date || '-'}</span></div>
                         <div class="field"><span class="field-label">号码:</span> <span id="v-num-${idx}">${d.invoice_number || '-'}</span></div>
@@ -802,10 +857,11 @@
                     const editFormHtml = isTrain ? `
                         <div class="edit-grid">
                             <div class="edit-field"><label>日期</label><input id="e-date-${idx}" value="${esc(d.date)}" placeholder="YYYY-MM-DD"></div>
+                            <div class="edit-field"><label>出发时间</label><input id="e-dtime-${idx}" value="${esc(d.depart_time)}" placeholder="HH:MM"></div>
                             <div class="edit-field"><label>车次</label><input id="e-train-${idx}" value="${esc(d.train_number)}" placeholder="G1234"></div>
+                            <div class="edit-field"><label>乘客姓名</label><input id="e-pname-${idx}" value="${esc(d.passenger_name)}" placeholder="姓名"></div>
                             <div class="edit-field"><label>出发站</label><input id="e-from-${idx}" value="${esc(d.from_station)}" placeholder="上海虹桥"></div>
                             <div class="edit-field"><label>到达站</label><input id="e-to-${idx}" value="${esc(d.to_station)}" placeholder="北京南"></div>
-                            <div class="edit-field"><label>乘客姓名</label><input id="e-pname-${idx}" value="${esc(d.passenger_name)}" placeholder="姓名"></div>
                             <div class="edit-field"><label>座位号</label><input id="e-seat-${idx}" value="${esc(d.seat)}" placeholder="08车06A号"></div>
                             <div class="edit-field"><label>座位类型</label><input id="e-stype-${idx}" value="${esc(d.seat_type)}" placeholder="二等座"></div>
                             <div class="edit-field"><label>票价（元）</label><input id="e-price-${idx}" value="${esc(d.price)}" placeholder="0.00"></div>
@@ -962,15 +1018,17 @@
             const isTrain = form.dataset.doctype === 'train';
 
             // 根据类型读取不同输入框
+            const g = id => (document.getElementById(id) || {}).value || '';
             const payload = isTrain ? {
-                date:           (document.getElementById(`e-date-${idx}`) ||{}).value || '',
-                train_number:   (document.getElementById(`e-train-${idx}`)||{}).value || '',
-                from_station:   (document.getElementById(`e-from-${idx}`) ||{}).value || '',
-                to_station:     (document.getElementById(`e-to-${idx}`)   ||{}).value || '',
-                passenger_name: (document.getElementById(`e-pname-${idx}`)||{}).value || '',
-                seat:           (document.getElementById(`e-seat-${idx}`) ||{}).value || '',
-                seat_type:      (document.getElementById(`e-stype-${idx}`)||{}).value || '',
-                price:          (document.getElementById(`e-price-${idx}`)||{}).value || '',
+                date:           g(`e-date-${idx}`),
+                depart_time:    g(`e-dtime-${idx}`),
+                train_number:   g(`e-train-${idx}`),
+                from_station:   g(`e-from-${idx}`),
+                to_station:     g(`e-to-${idx}`),
+                passenger_name: g(`e-pname-${idx}`),
+                seat:           g(`e-seat-${idx}`),
+                seat_type:      g(`e-stype-${idx}`),
+                price:          g(`e-price-${idx}`),
             } : {
                 date:           (document.getElementById(`e-date-${idx}`)   ||{}).value || '',
                 invoice_number: (document.getElementById(`e-num-${idx}`)    ||{}).value || '',
