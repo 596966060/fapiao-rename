@@ -197,6 +197,17 @@ class InvoiceExtractor:
                     break
 
         # === 购买方和销售方 ===
+        # 只是后缀、不含实质性公司名前缀 → 视为提取失败
+        _SUFFIX_ONLY = re.compile(
+            r'^(?:有限(?:责任)?公司|股份有限公司|集团公司|有限公司|责任公司|公司)$'
+        )
+        # 发票字段标签词本身不能作为公司名
+        _LABEL_WORDS = frozenset({
+            '名称', '金额', '税额', '地址', '电话', '合计', '税率',
+            '备注', '开票人', '识别号', '统一社会', '纳税人', '规格',
+            '项目', '单位', '数量', '单价', '备注', '信息',
+        })
+
         def clean_company(name):
             """清理公司名：截断噪音、校验合法性"""
             if not name:
@@ -215,7 +226,33 @@ class InvoiceExtractor:
                 return None
             if len(name) < 2 or len(name) > 60:
                 return None
+            # 拒绝纯后缀（如 "有限公司"），这表示 OCR 行只抓到了尾部
+            if _SUFFIX_ONLY.match(name):
+                return None
+            # 拒绝发票字段标签词（如 "名称"）
+            if name in _LABEL_WORDS:
+                return None
             return name
+
+        def _multiline_company(text, label_pat):
+            """
+            在 text 中匹配 label_pat 后紧跟的公司名。
+            支持跨行：若首行以 '有限'/'股份'/'集团' 结尾，则拼接下一行。
+            """
+            m = re.search(label_pat + r'\s*([^\n]+)', text, re.MULTILINE)
+            if not m:
+                return None
+            first = m.group(1).strip()
+            # 若首行看起来不完整（以有限/股份等词结尾，暗示名称被截断）
+            if re.search(r'(?:有限|股份|集团|科技|责任)\s*$', first):
+                # 取下一行，如果它不像字段标签就拼接
+                rest = text[m.end():]
+                next_line = re.match(r'\s*([^\n]{1,30})', rest)
+                if next_line:
+                    cont = next_line.group(1).strip()
+                    if not re.search(r'(?:纳税人|识别号|地址|开户|电话|购买方|销售方)', cont):
+                        first = first + cont
+            return first or None
 
         # 策略0: 同行双名称（OCR 将两列合并到一行，如 "名称: A公司  名称: B公司"）
         same_line_both = re.search(
@@ -225,33 +262,18 @@ class InvoiceExtractor:
         explicit_both = re.search(
             r'购买方\s*名称[：:]\s*(.+?)\s+销售方\s*名称[：:]\s*([^\n]+)', text)
 
-        # 策略1: 购买方——多模式，允许标签和名称之间有换行
-        _buyer_pats = [
-            r'购买方\s*名称[：:]\s*([^\n]+)',
-            r'购\s*买\s*方[^\n]{0,8}\n[^\n]{0,5}名称[：:]\s*([^\n]+)',
-            r'(?:购买方|购\s*方|买\s*方)[^\n]{0,30}?[1l名]称[：:]\s*([^\n]+)',
-        ]
-        buyer_raw = None
-        for p in _buyer_pats:
-            m = re.search(p, text, re.MULTILINE)
-            if m:
-                buyer_raw = m.group(1)
-                break
+        # 策略1: 购买方——多模式，支持跨行
+        buyer_raw = (
+            _multiline_company(text, r'购买方\s*名称[：:]')
+            or _multiline_company(text, r'(?:购买方|购\s*方|买\s*方)[^\n]{0,30}?[1l名]称[：:]')
+        )
 
-        # 策略1: 销售方——多模式，允许标签和名称之间有换行
-        _supplier_pats = [
-            r'销售方\s*名称[：:]\s*([^\n]+)',
-            r'销\s*售\s*方[^\n]{0,8}\n[^\n]{0,5}名称[：:]\s*([^\n]+)',
-            r'(?:销售方|销\s*方|卖\s*方)[^\n]{0,30}?[1l名]称[：:]\s*([^\n]+)',
-            # 兜底：识别"销"后跟任意空白再跟名称
-            r'销[^\n]{0,20}?名称[：:]\s*([^\n]+)',
-        ]
-        supplier_raw = None
-        for p in _supplier_pats:
-            m = re.search(p, text, re.MULTILINE)
-            if m:
-                supplier_raw = m.group(1)
-                break
+        # 策略1: 销售方——多模式，支持跨行
+        supplier_raw = (
+            _multiline_company(text, r'销售方\s*名称[：:]')
+            or _multiline_company(text, r'(?:销售方|销\s*方|卖\s*方)[^\n]{0,30}?[1l名]称[：:]')
+            or _multiline_company(text, r'销[^\n]{0,20}?名称[：:]')
+        )
 
         # 优先级：explicit_both > 策略1个别匹配 > same_line_both
         if explicit_both:
@@ -275,10 +297,10 @@ class InvoiceExtractor:
                 result["supplier"] = s
 
         # 策略2: 按出现顺序收集所有 "名称:" 内容，补全缺失的一方
-        # （条件修正为 OR：任意一方缺失就运行）
+        # 注意：用 [ \t]* 而非 \s* 避免跨行消耗（\s 会匹配换行符）
         if not result["buyer"] or not result["supplier"]:
             company_lines = []
-            for pat in (r'[1l名]称[：:]\s*([^\n]+)', r'名称[：:]\s*([^\n]+)'):
+            for pat in (r'[1l名]称[：:][ \t]*([^\n]+)', r'名称[：:][ \t]*([^\n]+)'):
                 for m in re.findall(pat, text):
                     c = clean_company(m)
                     if c and c not in company_lines:
@@ -950,37 +972,35 @@ def process_zip_file(zip_path: str, reader, session_dir: str) -> list:
 
 @app.route('/api/download/<session_id>', methods=['GET'])
 def download_results(session_id):
-    """下载重命名后的发票文件（ZIP 格式）"""
+    """返回本次会话所有可下载文件的列表（文件名 + 下载 URL）"""
     if session_id not in UPLOAD_RESULTS:
         return jsonify({'error': '会话已过期'}), 400
+    results = UPLOAD_RESULTS[session_id]['results']
+    files = [
+        {'new_name': item['new_name'], 'index': i}
+        for i, item in enumerate(results)
+        if item['status'] == 'success'
+    ]
+    return jsonify({'files': files})
 
+
+@app.route('/api/download-file/<session_id>/<int:item_idx>', methods=['GET'])
+def download_single_file(session_id, item_idx):
+    """下载单个重命名后的文件"""
+    if session_id not in UPLOAD_RESULTS:
+        return jsonify({'error': '会话已过期'}), 400
     session_data = UPLOAD_RESULTS[session_id]
-    session_dir = session_data['session_dir']
     results = session_data['results']
-
-    if not os.path.exists(session_dir):
+    if item_idx < 0 or item_idx >= len(results):
+        return jsonify({'error': '索引越界'}), 400
+    item = results[item_idx]
+    if item['status'] != 'success':
+        return jsonify({'error': '该文件未成功识别'}), 400
+    new_name = item['new_name']
+    file_path = os.path.join(session_data['session_dir'], new_name)
+    if not os.path.exists(file_path):
         return jsonify({'error': '文件已过期'}), 400
-
-    # 创建 ZIP 文件，包含所有重命名后的文件
-    output_zip = io.BytesIO()
-
-    with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as z:
-        # 添加成功识别的文件
-        for item in results:
-            if item['status'] == 'success':
-                new_name = item['new_name']
-                file_path = os.path.join(session_dir, new_name)
-                if os.path.exists(file_path):
-                    z.write(file_path, arcname=new_name)
-
-    output_zip.seek(0)
-
-    return send_file(
-        output_zip,
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name=f'发票重命名_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
-    )
+    return send_file(file_path, as_attachment=True, download_name=new_name)
 
 
 def _build_csv_bytes(results: list) -> bytes:
@@ -1329,7 +1349,7 @@ def update_item(session_id, item_index):
     # 更新字段（发票 + 火车票字段均接受，只更新有值的）
     all_fields = ('date', 'invoice_number', 'buyer', 'supplier',
                   'tax_free_amount', 'tax_amount', 'amount',
-                  'train_number', 'from_station', 'to_station',
+                  'train_number', 'depart_time', 'from_station', 'to_station',
                   'passenger_name', 'seat', 'seat_type', 'price')
     for field in all_fields:
         if field in payload:
