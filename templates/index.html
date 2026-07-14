@@ -942,15 +942,22 @@
             if (btnEl) btnEl.disabled = true;
 
             // 尝试 File System Access API
+            // 注意：在 iframe 内会抛出 SecurityError，需回退到逐文件下载
+            let dirHandle = null;
             if ('showDirectoryPicker' in window) {
-                let dirHandle;
                 try {
                     dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
                 } catch (e) {
-                    // 用户取消选择
-                    if (btnEl) btnEl.disabled = false;
-                    return;
+                    if (e.name === 'AbortError') {
+                        // 用户主动取消，不做任何事
+                        if (btnEl) btnEl.disabled = false;
+                        return;
+                    }
+                    // SecurityError（如 iframe 环境）或其他错误 → 回退到逐文件下载
+                    dirHandle = null;
                 }
+            }
+            if (dirHandle) {
                 showStatus(`⏳ 正在保存 0 / ${files.length}…`, 'loading');
                 let saved = 0, failed = 0;
                 for (const f of files) {
