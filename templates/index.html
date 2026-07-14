@@ -670,8 +670,8 @@
                     <button class="btn-upload" onclick="document.getElementById('fileInput').click()">
                         📤 继续上传
                     </button>
-                    <button class="btn-download" id="downloadBtn" onclick="downloadResults()" title="选择文件夹，将所有重命名文件直接保存进去">
-                        ⬇️ 保存到文件夹
+                    <button class="btn-download" id="downloadBtn" onclick="downloadResults()" title="选择保存位置，所有文件将存入同一文件夹">
+                        📁 保存到文件夹
                     </button>
                     <button class="btn-export" id="exportBtn" onclick="exportCSV()" disabled>
                         📊 本次 CSV
@@ -978,21 +978,27 @@
                     : `✅ 已保存 ${saved} 个文件到所选文件夹`;
                 showStatus(msg, failed ? 'error' : 'success');
             } else {
-                // 回退：逐文件触发浏览器下载（保存到默认下载文件夹）
-                showStatus(`⏳ 浏览器不支持文件夹选择，将依次触发 ${files.length} 个下载…`, 'loading');
+                // 回退：用 download="文件夹名/文件名" 技巧，浏览器会在下载目录自动新建子文件夹
+                const now    = new Date();
+                const pad    = n => String(n).padStart(2, '0');
+                const folder = `发票_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+                showStatus(`⏳ 正在保存到下载目录中的「${folder}」文件夹… (0/${files.length})`, 'loading');
                 files.forEach((f, i) => {
                     setTimeout(() => {
                         const a = document.createElement('a');
                         a.href = fileUrlFn(f);
-                        a.download = f.new_name;
+                        a.download = `${folder}/${f.new_name}`;
                         a.style.display = 'none';
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
+                        if (i === files.length - 1) {
+                            showStatus(`✅ 已保存 ${files.length} 个文件到「${folder}」`, 'success');
+                            if (btnEl) btnEl.disabled = false;
+                        }
                     }, i * 350);
                 });
-                setTimeout(() => showStatus(`✅ 已触发 ${files.length} 个文件下载`, 'success'),
-                           files.length * 350 + 500);
+                return; // 按钮在最后一个文件回调里解锁
             }
             if (btnEl) btnEl.disabled = false;
         }
