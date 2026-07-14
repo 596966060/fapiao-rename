@@ -1113,6 +1113,30 @@ def process_zip_file(zip_path: str, reader, session_dir: str) -> list:
     return results
 
 
+@app.route('/api/download-zip/<session_id>', methods=['GET'])
+def download_zip(session_id):
+    """将本次会话所有重命名文件打包成 ZIP 并下载（浏览器弹出另存为对话框）"""
+    if session_id not in UPLOAD_RESULTS:
+        return jsonify({'error': '会话已过期'}), 400
+    session_data = UPLOAD_RESULTS[session_id]
+    results  = session_data['results']
+    sdir     = session_data['session_dir']
+    success  = [item for item in results if item['status'] == 'success']
+    if not success:
+        return jsonify({'error': '无可下载文件'}), 400
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for item in success:
+            fpath = os.path.join(sdir, item['new_name'])
+            if os.path.exists(fpath):
+                zf.write(fpath, item['new_name'])
+    zip_buf.seek(0)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return send_file(zip_buf, mimetype='application/zip',
+                     as_attachment=True,
+                     download_name=f'发票_{ts}.zip')
+
+
 @app.route('/api/download/<session_id>', methods=['GET'])
 def download_results(session_id):
     """返回本次会话所有可下载文件的列表（文件名 + 下载 URL）"""
