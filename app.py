@@ -1525,7 +1525,12 @@ def batch_add(session_id):
         return jsonify({'error': '会话已过期'}), 404
     session_data = UPLOAD_RESULTS[session_id]
     with BATCH_LOCK:
-        BATCH_RESULTS.extend(session_data['results'])
+        for idx, item in enumerate(session_data['results']):
+            # 记录来源 session 和索引，供批次逐文件下载使用
+            item_copy = dict(item)
+            item_copy['session_id'] = session_id
+            item_copy['_idx']       = idx
+            BATCH_RESULTS.append(item_copy)
         BATCH_SESSION_DIRS.append(session_data['session_dir'])
         total   = len(BATCH_RESULTS)
         success = sum(1 for r in BATCH_RESULTS if r['status'] == 'success')
@@ -1539,6 +1544,36 @@ def batch_status():
         total   = len(BATCH_RESULTS)
         success = sum(1 for r in BATCH_RESULTS if r['status'] == 'success')
     return jsonify({'total': total, 'success': success})
+
+
+@app.route('/api/batch/files', methods=['GET'])
+def batch_files():
+    """返回批次中所有可下载文件的列表（供前端逐文件写入文件夹用）"""
+    with BATCH_LOCK:
+        results      = list(BATCH_RESULTS)
+        session_dirs = list(BATCH_SESSION_DIRS)
+    if not results:
+        return jsonify({'files': []})
+
+    files = []
+    # 按照各 session_dir 逐文件扫描，与 BATCH_RESULTS 顺序一致
+    seen_names: dict = {}
+    for sdir in session_dirs:
+        if not os.path.isdir(sdir):
+            continue
+        for item in results:
+            fname = item.get('new_name', '')
+            if not fname:
+                continue
+            fpath = os.path.join(sdir, fname)
+            if not os.path.exists(fpath):
+                continue
+            # 取 session_id 供前端复用 download-file 接口
+            sid = item.get('session_id', '')
+            idx = item.get('_idx', None)
+            if sid and idx is not None:
+                files.append({'new_name': fname, 'session_id': sid, 'index': idx})
+    return jsonify({'files': files})
 
 
 @app.route('/api/batch/download', methods=['GET'])

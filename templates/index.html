@@ -670,8 +670,8 @@
                     <button class="btn-upload" onclick="document.getElementById('fileInput').click()">
                         📤 继续上传
                     </button>
-                    <button class="btn-download" id="downloadBtn" onclick="downloadResults()">
-                        ⬇️ 本次下载
+                    <button class="btn-download" id="downloadBtn" onclick="downloadResults()" title="选择文件夹，将所有重命名文件直接保存进去">
+                        ⬇️ 保存到文件夹
                     </button>
                     <button class="btn-export" id="exportBtn" onclick="exportCSV()" disabled>
                         📊 本次 CSV
@@ -703,8 +703,8 @@
                         </div>
                     </div>
                     <div class="batch-actions">
-                        <button class="btn-batch-dl" id="batchDlBtn" onclick="downloadBatch()">
-                            ⬇️ 下载批次 ZIP
+                        <button class="btn-batch-dl" id="batchDlBtn" onclick="downloadBatch()" title="选择文件夹，将批次所有文件保存进去">
+                            ⬇️ 批次保存到文件夹
                         </button>
                         <button class="btn-batch-exp" id="batchExpBtn" onclick="exportBatchCSV()">
                             📊 批次 CSV
@@ -935,35 +935,76 @@
             document.body.removeChild(a);
         }
 
-        // 本次下载全部：逐文件触发，不打包 ZIP
-        function downloadResults() {
-            if (!currentSessionId) return;
-            const btn = document.getElementById('downloadBtn');
-            btn.disabled = true;
-            showStatus('⏳ 正在获取文件列表...', 'loading');
-            fetch(`/api/download/${currentSessionId}`)
-            .then(r => r.json())
-            .then(data => {
-                if (data.error) { showStatus(`❌ ${data.error}`, 'error'); return; }
-                const files = data.files || [];
-                if (files.length === 0) { showStatus('⚠️ 无可下载文件', 'error'); return; }
-                // 逐文件依次触发下载（间隔 300ms 避免浏览器拦截）
+        // ---- 通用：将文件列表保存到用户选择的文件夹 ----
+        // 支持 File System Access API（Chrome/Edge）；不支持时退回逐文件触发下载
+        async function saveFilesToFolder(files, fileUrlFn, btnEl) {
+            if (!files.length) { showStatus('⚠️ 无可下载文件', 'error'); return; }
+            if (btnEl) btnEl.disabled = true;
+
+            // 尝试 File System Access API
+            if ('showDirectoryPicker' in window) {
+                let dirHandle;
+                try {
+                    dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                } catch (e) {
+                    // 用户取消选择
+                    if (btnEl) btnEl.disabled = false;
+                    return;
+                }
+                showStatus(`⏳ 正在保存 0 / ${files.length}…`, 'loading');
+                let saved = 0, failed = 0;
+                for (const f of files) {
+                    try {
+                        const resp = await fetch(fileUrlFn(f));
+                        if (!resp.ok) throw new Error('fetch failed');
+                        const blob = await resp.blob();
+                        const fh   = await dirHandle.getFileHandle(f.new_name, { create: true });
+                        const wr   = await fh.createWritable();
+                        await wr.write(blob);
+                        await wr.close();
+                        saved++;
+                    } catch (_) { failed++; }
+                    showStatus(`⏳ 正在保存 ${saved + failed} / ${files.length}…`, 'loading');
+                }
+                const msg = failed
+                    ? `✅ 已保存 ${saved} 个，${failed} 个失败`
+                    : `✅ 已保存 ${saved} 个文件到所选文件夹`;
+                showStatus(msg, failed ? 'error' : 'success');
+            } else {
+                // 回退：逐文件触发浏览器下载（保存到默认下载文件夹）
+                showStatus(`⏳ 浏览器不支持文件夹选择，将依次触发 ${files.length} 个下载…`, 'loading');
                 files.forEach((f, i) => {
                     setTimeout(() => {
                         const a = document.createElement('a');
-                        a.href = `/api/download-file/${currentSessionId}/${f.index}`;
+                        a.href = fileUrlFn(f);
+                        a.download = f.new_name;
                         a.style.display = 'none';
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
-                    }, i * 300);
+                    }, i * 350);
                 });
-                setTimeout(() => {
-                    btn.disabled = false;
-                    showStatus(`✅ 共触发 ${files.length} 个文件下载`, 'success');
-                }, files.length * 300 + 500);
-            })
-            .catch(() => { showStatus('❌ 下载失败', 'error'); btn.disabled = false; });
+                setTimeout(() => showStatus(`✅ 已触发 ${files.length} 个文件下载`, 'success'),
+                           files.length * 350 + 500);
+            }
+            if (btnEl) btnEl.disabled = false;
+        }
+
+        // 本次下载全部：选择文件夹后逐文件写入
+        async function downloadResults() {
+            if (!currentSessionId) return;
+            const btn = document.getElementById('downloadBtn');
+            showStatus('⏳ 正在获取文件列表…', 'loading');
+            try {
+                const data = await fetch(`/api/download/${currentSessionId}`).then(r => r.json());
+                if (data.error) { showStatus(`❌ ${data.error}`, 'error'); return; }
+                const files = data.files || [];
+                await saveFilesToFolder(
+                    files,
+                    f => `/api/download-file/${currentSessionId}/${f.index}`,
+                    btn
+                );
+            } catch (_) { showStatus('❌ 获取文件列表失败', 'error'); btn.disabled = false; }
         }
 
         function exportCSV() {
@@ -1020,10 +1061,21 @@
             .catch(() => { showStatus('❌ 加入批次失败', 'error'); btn.textContent = '➕ 加入批次'; btn.disabled = false; });
         }
 
-        function downloadBatch() {
-            showStatus('⏳ 正在打包批次文件...', 'loading');
-            window.location.href = '/api/batch/download';
-            setTimeout(() => showStatus('✅ 批次下载完成！', 'success'), 1500);
+        async function downloadBatch() {
+            const btn = document.getElementById('batchDlBtn');
+            showStatus('⏳ 正在获取批次文件列表…', 'loading');
+            try {
+                const data = await fetch('/api/batch/files').then(r => r.json());
+                const files = data.files || [];
+                if (!files.length) {
+                    showStatus('⚠️ 批次中无可下载文件', 'error'); return;
+                }
+                await saveFilesToFolder(
+                    files,
+                    f => `/api/download-file/${f.session_id}/${f.index}`,
+                    btn
+                );
+            } catch (_) { showStatus('❌ 获取批次文件列表失败', 'error'); }
         }
 
         function exportBatchCSV() {
