@@ -237,21 +237,38 @@ class InvoiceExtractor:
         def _multiline_company(text, label_pat):
             """
             在 text 中匹配 label_pat 后紧跟的公司名。
-            支持跨行：若首行以 '有限'/'股份'/'集团' 结尾，则拼接下一行。
+            用 [ \\t]* 不跨行；首行不完整时尝试拼接下一行。
             """
-            m = re.search(label_pat + r'\s*([^\n]+)', text, re.MULTILINE)
+            m = re.search(label_pat + r'[ \t]*([^\n]*)', text, re.MULTILINE)
             if not m:
                 return None
             first = m.group(1).strip()
-            # 若首行看起来不完整（以有限/股份等词结尾，暗示名称被截断）
-            if re.search(r'(?:有限|股份|集团|科技|责任)\s*$', first):
-                # 取下一行，如果它不像字段标签就拼接
-                rest = text[m.end():]
-                next_line = re.match(r'\s*([^\n]{1,30})', rest)
-                if next_line:
-                    cont = next_line.group(1).strip()
-                    if not re.search(r'(?:纳税人|识别号|地址|开户|电话|购买方|销售方)', cont):
-                        first = first + cont
+            # 取下一行
+            rest = text[m.end():]
+            next_line = re.match(r'[ \t]*([^\n]{1,40})', rest)
+            cont = next_line.group(1).strip() if next_line else ''
+
+            # 判断是否需要拼接：首行缺省/很短/以不完整词结尾
+            is_incomplete = (
+                not first                                                        # 行内无内容
+                or len(first) < 6                                                # 太短
+                or re.search(r'(?:有限|股份|集团|科技|责任|管理|实业|发展)\s*$', first)
+            )
+            # 下一行像是公司后续（含公司关键词，且不是字段标签）
+            is_continuation = bool(cont) and bool(
+                re.search(r'(?:公司|有限|责任|集团|股份|管理|科技|发展|实业)', cont)
+            ) and not re.search(
+                r'(?:纳税人|识别号|地址|开户|电话|购买方|销售方|统一社会|信用代码)', cont
+            )
+
+            if is_incomplete and is_continuation:
+                first = (first + cont).strip()
+            elif not first and cont and not re.search(
+                r'(?:纳税人|识别号|地址|开户|电话|购买方|销售方)', cont
+            ):
+                # 标签后为空行，直接取下一行内容
+                first = cont
+
             return first or None
 
         # 策略0: 同行双名称（OCR 将两列合并到一行，如 "名称: A公司  名称: B公司"）
@@ -422,14 +439,13 @@ class InvoiceExtractor:
 
 
 def generate_filename(data: dict, original_ext: str) -> str:
-    """生成发票新文件名"""
-    date = data.get('date') or '0000-01-01'
-    invoice_num = data.get('invoice_number') or '000000'
-    buyer = (data.get('buyer') or '')[:20]
+    """生成发票新文件名：日期_销售方_购买方_金额元.ext"""
+    date     = data.get('date') or '0000-01-01'
+    buyer    = (data.get('buyer')    or '')[:20]
     supplier = (data.get('supplier') or '')[:20]
-    amount = data.get('amount') or '0.00'
+    amount   = data.get('amount') or '0.00'
 
-    new_name = f"{date}_{invoice_num}_{buyer}_{supplier}_{amount}元{original_ext}"
+    new_name = f"{date}_{supplier}_{buyer}_{amount}元{original_ext}"
     new_name = re.sub(r'[\\/:*?"<>|]', '', new_name)
     new_name = re.sub(r'_+', '_', new_name).strip('_')
     return new_name or f"invoice_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
@@ -647,22 +663,57 @@ class TrainTicketExtractor:
             return '' if s in _station_extra_excl else s
 
         # === 出发站 / 到达站 ===
-        # 策略1：明确标签（兼容"始发站/终到站"电子客票格式和"出发站/到达站"格式）
-        _label_from = re.search(
-            r'(?:出\s*发\s*站|始\s*发\s*站)[：:\s]*([\u4e00-\u9fa5]{2,12})', text)
-        _label_to   = re.search(
-            r'(?:到\s*达\s*站|终\s*到\s*站|目\s*的\s*地)[：:\s]*([\u4e00-\u9fa5]{2,12})', text)
-        if _label_from:
-            s = _clean_st(_label_from.group(1))
-            if s: result['from_station'] = s
-        if _label_to:
-            s = _clean_st(_label_to.group(1))
-            if s: result['to_station'] = s
+        # 辅助：在标签后（同行或下一行）提取站名
+        def _find_labeled_station(label_regex):
+            """支持 '标签：站名' 和 '标签\\n站名' 两种格式"""
+            # 同行格式：标签: 站名
+            m = re.search(label_regex + r'[ \t]*([\u4e00-\u9fa5]{2,12})', text)
+            if m:
+                s = _clean_st(m.group(1))
+                if s:
+                    return s
+            # 跨行格式：标签（含可选空白/冒号后）占一行，下一行是站名
+            m2 = re.search(label_regex + r'[：: \t]*\n[ \t]*([\u4e00-\u9fa5]{2,12})', text)
+            if m2:
+                s = _clean_st(m2.group(1))
+                if s:
+                    return s
+            return None
 
-        # 策略2：箭头/横线分隔（最常见：上海虹桥→北京南）
+        # 策略1a：明确标签（支持同行/跨行）
+        _from_labeled = _find_labeled_station(r'(?:出\s*发\s*站|始\s*发\s*站)')
+        _to_labeled   = _find_labeled_station(r'(?:到\s*达\s*站|终\s*到\s*站|目\s*的\s*地)')
+        if _from_labeled: result['from_station'] = _from_labeled
+        if _to_labeled:   result['to_station']   = _to_labeled
+
+        # 策略1b：双栏格式「始发站  终到站\n上海虹桥  杭州东」
+        if not result['from_station'] or not result['to_station']:
+            two_col = re.search(
+                r'(?:始发站|出发站)[ \t]+(?:终到站|到达站)[^\n]*\n'
+                r'[ \t]*([\u4e00-\u9fa5]{2,12})[ \t]+([\u4e00-\u9fa5]{2,12})',
+                text)
+            if two_col:
+                f = _clean_st(two_col.group(1))
+                t = _clean_st(two_col.group(2))
+                if f and not result['from_station']: result['from_station'] = f
+                if t and not result['to_station']:   result['to_station']   = t
+
+        # 策略1c：紧凑双栏（两组汉字之间只有空白，紧跟在标签行之后）
+        if not result['from_station'] or not result['to_station']:
+            compact = re.search(
+                r'(?:始发站|出发站|出发)[^\n]*\n'
+                r'[ \t]*([\u4e00-\u9fa5]{2,10})\s+([\u4e00-\u9fa5]{2,10})',
+                text)
+            if compact:
+                f = _clean_st(compact.group(1))
+                t = _clean_st(compact.group(2))
+                if f and not result['from_station']: result['from_station'] = f
+                if t and not result['to_station']:   result['to_station']   = t
+
+        # 策略2：箭头/横线分隔（上海虹桥→北京南）
         if not result['from_station'] or not result['to_station']:
             arrow = re.search(
-                r'([\u4e00-\u9fa5]{2,10}(?:站)?)\s*[→➜>\-—至]\s*([\u4e00-\u9fa5]{2,10}(?:站)?)',
+                r'([\u4e00-\u9fa5]{2,10}(?:站)?)\s*[→➜>—至]\s*([\u4e00-\u9fa5]{2,10}(?:站)?)',
                 text)
             if arrow:
                 f = _clean_st(arrow.group(1))
@@ -670,8 +721,7 @@ class TrainTicketExtractor:
                 if f and not result['from_station']: result['from_station'] = f
                 if t and not result['to_station']:   result['to_station']   = t
 
-        # 策略3：带复合方位词后缀（东站/西站/南站/北站/虹桥/高铁）
-        # 注意：单字方位词（东/西/南/北）需要 >=4 字总长，防止"梁立东"之类的误匹配
+        # 策略3：含复合方位词后缀（东站/西站/南站/北站/虹桥/高铁）
         if not result['from_station'] or not result['to_station']:
             station_candidates = re.findall(
                 r'([\u4e00-\u9fa5]{2,8}(?:虹桥|高铁|北站|南站|东站|西站)(?:站)?'
@@ -695,6 +745,22 @@ class TrainTicketExtractor:
                 result['from_station'] = with_zhan[0]
             if not result['to_station'] and len(with_zhan) >= 2:
                 result['to_station'] = with_zhan[1]
+
+        # 策略5：纯汉字两段式（相邻两组2-6字中文，无方位词，最后兜底）
+        # 仅当两个站都缺失时启用，以降低误匹配风险
+        if not result['from_station'] and not result['to_station']:
+            # 排除姓名、已知黑名单词
+            _excl_names = _station_extra_excl | {result.get('passenger_name') or ''}
+            pure_zh = [
+                s for s in re.findall(r'([\u4e00-\u9fa5]{2,6})', text)
+                if s not in _excl_names
+                and not self._STATION_BLACKLIST.match(s)
+                and re.search(r'(?:站|桥|路|门|场|港)', s)  # 需要含常见地名词
+            ]
+            if len(pure_zh) >= 1:
+                result['from_station'] = _clean_st(pure_zh[0])
+            if len(pure_zh) >= 2:
+                result['to_station'] = _clean_st(pure_zh[1])
 
         # === 座位类型 ===
         for st in self._SEAT_TYPES:
