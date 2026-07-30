@@ -1716,3 +1716,106 @@ if __name__ == '__main__':
             print(f"\n❌ 启动失败: {e}")
     except KeyboardInterrupt:
         print("\n已停止服务")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ======================== 合同提取 ========================
+class ContractExtractor:
+    """合同文本提取（支持 PDF 矢量文本与 Word）"""
+    
+    @staticmethod
+    def extract_text(file_path: str) -> str:
+        ext = Path(file_path).suffix.lower()
+        text = ""
+        if ext == '.pdf':
+            # 复用现有的 PDF 直提逻辑
+            text = _pdf_direct_text(file_path) or ""
+        elif ext == '.docx':
+            try:
+                doc = docx.Document(file_path)
+                text = "\n".join([p.text for p in doc.paragraphs])
+            except Exception as e:
+                print(f"Word 读取失败: {e}")
+        return text
+
+    @staticmethod
+    def extract_fields(text: str, original_filename: str) -> dict:
+        info = {
+            "contract_name": "未知合同",
+            "party_a": "未知甲方",
+            "party_b": "未知乙方",
+            "sign_date": "未知时间",
+            "amount": "未知金额"
+        }
+        
+        # 1. 合同名称
+        lines = text.split('\n')
+        for line in lines[:15]:
+            stripped = line.strip()
+            if ("合同" in stripped or "协议" in stripped) and 4 < len(stripped) < 80:
+                info["contract_name"] = stripped
+                break
+        if info["contract_name"] == "未知合同":
+            info["contract_name"] = Path(original_filename).stem
+            
+        # 2. 甲乙方
+        pa = re.search(r'甲方[：:]\s*([^\n\r(（]+)', text)
+        if pa: info["party_a"] = pa.group(1).strip()[:30]
+        
+        pb = re.search(r'乙方[：:]\s*([^\n\r(（]+)', text)
+        if pb: info["party_b"] = pb.group(1).strip()[:30]
+        
+        # 3. 签订时间 (转为 YYYYMMDD)
+        date_match = re.search(r'(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})[日]?', text)
+        if date_match:
+            y, m, d = date_match.group(1), date_match.group(2).zfill(2), date_match.group(3).zfill(2)
+            info["sign_date"] = f"{y}{m}{d}"
+            
+        # 4. 金额
+        amt = re.search(r'人民币[（(]大写[）)]\s*([^\n\r]+)', text)
+        if not amt:
+            amt = re.search(r'[¥￥]\s*([0-9,]+\.\d{2})', text)
+        if amt:
+            info["amount"] = amt.group(1).strip()
+            
+        return info
+
+def generate_contract_filename(data: dict, original_ext: str) -> str:
+    """生成合同新文件名：签订时间-合同名称_甲方_乙方_金额.ext"""
+    sign_date = data.get('sign_date') or '00000000'
+    name = (data.get('contract_name') or '未知合同')[:30]
+    pa = (data.get('party_a') or '未知甲方')[:20]
+    pb = (data.get('party_b') or '未知乙方')[:20]
+    amount = data.get('amount') or '未知金额'
+    
+    new_name = f"{sign_date}-{name}_{pa}_{pb}_{amount}{original_ext}"
+    new_name = re.sub(r'[\\/:*?"<>|]', '_', new_name)
+    return new_name or f"contract_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
