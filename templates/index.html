@@ -66,6 +66,11 @@
             transform: scale(1.02);
         }
 
+        /* 内部元素不拦截拖拽事件，让事件冒泡到 upload-area */
+        .upload-area > *:not(input) {
+            pointer-events: none;
+        }
+
         .upload-icon {
             font-size: 64px;
             margin-bottom: 20px;
@@ -643,9 +648,9 @@
                 <div class="upload-text">点击或拖拽上传</div>
                 <div class="upload-hint">支持批量上传单个文件或 ZIP 压缩包</div>
                 <div class="upload-formats">
-                    ✓ PDF &nbsp; ✓ JPG/PNG/BMP/GIF/TIFF &nbsp; ✓ ZIP
+                    ✓ PDF &nbsp; ✓ Word(.docx) &nbsp; ✓ JPG/PNG/BMP/GIF/TIFF &nbsp; ✓ ZIP
                 </div>
-                <input type="file" id="fileInput" multiple accept=".pdf,.jpg,.jpeg,.png,.bmp,.gif,.tiff,.tif,.zip">
+                <input type="file" id="fileInput" multiple accept=".pdf,.jpg,.jpeg,.png,.bmp,.gif,.tiff,.tif,.zip,.docx,.doc">
             </div>
 
             <div id="resultsSection" class="results-section">
@@ -751,15 +756,32 @@
         updateBatchStatus();   // 页面刷新时也恢复批次计数
 
         // ---- 拖拽 ----
-        uploadArea.addEventListener('dragover', (e) => {
+        // 用计数器解决"移入子元素触发 dragleave"的经典问题
+        let _dragCount = 0;
+
+        // 阻止整页的默认拖放行为（防止浏览器直接打开文件）
+        ['dragover', 'drop'].forEach(evt =>
+            document.addEventListener(evt, e => e.preventDefault(), false)
+        );
+
+        uploadArea.addEventListener('dragenter', (e) => {
             e.preventDefault();
+            _dragCount++;
             if (ocrReady) uploadArea.classList.add('dragover');
         });
-        uploadArea.addEventListener('dragleave', () => { uploadArea.classList.remove('dragover'); });
+        uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); });
+        uploadArea.addEventListener('dragleave', (e) => {
+            _dragCount--;
+            if (_dragCount <= 0) {
+                _dragCount = 0;
+                uploadArea.classList.remove('dragover');
+            }
+        });
         uploadArea.addEventListener('drop', (e) => {
             e.preventDefault();
+            _dragCount = 0;
             uploadArea.classList.remove('dragover');
-            if (ocrReady) handleFiles(e.dataTransfer.files);
+            if (ocrReady && e.dataTransfer.files.length > 0) handleFiles(e.dataTransfer.files);
         });
         uploadArea.addEventListener('click', () => { if (ocrReady) fileInput.click(); });
         fileInput.addEventListener('change', (e) => { if (ocrReady) handleFiles(e.target.files); });
@@ -825,14 +847,18 @@
                 div.className = `file-item ${item.status}`;
 
                 if (item.status === 'success') {
-                    const d        = item.data || {};
-                    const isTrain  = item.doc_type === 'train';
-                    const typeTag  = isTrain
+                    const d           = item.data || {};
+                    const dtype       = item.doc_type || 'invoice';
+                    const isTrain     = dtype === 'train';
+                    const isContract  = dtype === 'contract';
+                    const typeTag = isTrain
                         ? `<span style="background:#2b6cb0;color:white;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;">🚄 火车票</span>`
+                        : isContract
+                        ? `<span style="background:#6b21a8;color:white;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;">📋 合同</span>`
                         : `<span style="background:#276749;color:white;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;">🧾 发票</span>`;
 
                     if (d._raw_text) {
-                        console.log(`\n--- File ${idx + 1}: ${item.filename} [${item.doc_type || 'invoice'}] ---`);
+                        console.log(`\n--- File ${idx + 1}: ${item.filename} [${dtype}] ---`);
                         console.log('Raw OCR Text:\n' + d._raw_text);
                     }
                     const rawHtml = d._raw_text
@@ -858,6 +884,14 @@
                             <div class="field"><span class="field-label">座位:</span> <span id="v-seat-${idx}">${d.seat || '-'}${d.seat_type ? ' (' + d.seat_type + ')' : ''}</span></div>
                             <div class="field"><span class="field-label">票价:</span> <span id="v-price-${idx}">${d.price ? d.price + ' 元' : '-'}</span></div>
                         </div>
+                    ` : isContract ? `
+                        <div class="file-fields" style="border-left:3px solid #6b21a8;padding-left:10px;">
+                            <div class="field"><span class="field-label">合同名称:</span> <span id="v-cname-${idx}">${d.contract_name || '-'}</span></div>
+                            <div class="field"><span class="field-label">签订日期:</span> <span id="v-sdate-${idx}">${d.sign_date || '-'}</span></div>
+                            <div class="field"><span class="field-label">甲方:</span> <span id="v-ptyA-${idx}">${d.party_a || '-'}</span></div>
+                            <div class="field"><span class="field-label">乙方:</span> <span id="v-ptyB-${idx}">${d.party_b || '-'}</span></div>
+                            <div class="field"><span class="field-label">合同金额:</span> <span id="v-camount-${idx}">${d.amount ? d.amount + ' 元' : '-'}</span></div>
+                        </div>
                     ` : `
                         <div class="field"><span class="field-label">日期:</span> <span id="v-date-${idx}">${d.date || '-'}</span></div>
                         <div class="field"><span class="field-label">号码:</span> <span id="v-num-${idx}">${d.invoice_number || '-'}</span></div>
@@ -881,6 +915,14 @@
                             <div class="edit-field"><label>座位类型</label><input id="e-stype-${idx}" value="${esc(d.seat_type)}" placeholder="二等座"></div>
                             <div class="edit-field"><label>票价（元）</label><input id="e-price-${idx}" value="${esc(d.price)}" placeholder="0.00"></div>
                         </div>
+                    ` : isContract ? `
+                        <div class="edit-grid">
+                            <div class="edit-field"><label>合同名称</label><input id="e-cname-${idx}" value="${esc(d.contract_name)}" placeholder="货物采购合同"></div>
+                            <div class="edit-field"><label>签订日期</label><input id="e-sdate-${idx}" value="${esc(d.sign_date)}" placeholder="YYYY-MM-DD"></div>
+                            <div class="edit-field"><label>甲方（全称）</label><input id="e-ptyA-${idx}" value="${esc(d.party_a)}" placeholder="甲方单位名称"></div>
+                            <div class="edit-field"><label>乙方（全称）</label><input id="e-ptyB-${idx}" value="${esc(d.party_b)}" placeholder="乙方单位名称"></div>
+                            <div class="edit-field"><label>合同金额（元）</label><input id="e-camount-${idx}" value="${esc(d.amount)}" placeholder="0.00"></div>
+                        </div>
                     ` : `
                         <div class="edit-grid">
                             <div class="edit-field"><label>日期</label><input id="e-date-${idx}" value="${esc(d.date)}" placeholder="YYYY-MM-DD"></div>
@@ -900,7 +942,7 @@
                         <span class="file-status success">✓ 识别成功</span>
                         <button class="btn-edit" onclick="toggleEdit(${idx})">✏️ 编辑字段</button>
                         <button class="btn-dl-single" onclick="downloadSingle(${idx})" title="下载此重命名文件">⬇️ 下载</button>
-                        <div class="edit-form" id="edit-form-${idx}" data-doctype="${isTrain ? 'train' : 'invoice'}">
+                        <div class="edit-form" id="edit-form-${idx}" data-doctype="${dtype}">
                             ${editFormHtml}
                             <div class="edit-btns">
                                 <button class="btn-save" onclick="saveEdit(${idx})">💾 保存</button>
@@ -1128,34 +1170,47 @@
 
         function saveEdit(idx) {
             if (!currentSessionId) return;
-            const form    = document.getElementById(`edit-form-${idx}`);
-            const isTrain = form.dataset.doctype === 'train';
+            const form       = document.getElementById(`edit-form-${idx}`);
+            const dtype      = form.dataset.doctype;
+            const isTrain    = dtype === 'train';
+            const isContract = dtype === 'contract';
 
-            // 根据类型读取不同输入框
             const g = id => (document.getElementById(id) || {}).value || '';
-            const payload = isTrain ? {
-                date:           g(`e-date-${idx}`),
-                depart_time:    g(`e-dtime-${idx}`),
-                train_number:   g(`e-train-${idx}`),
-                from_station:   g(`e-from-${idx}`),
-                to_station:     g(`e-to-${idx}`),
-                passenger_name: g(`e-pname-${idx}`),
-                seat:           g(`e-seat-${idx}`),
-                seat_type:      g(`e-stype-${idx}`),
-                price:          g(`e-price-${idx}`),
-            } : {
-                date:           (document.getElementById(`e-date-${idx}`)   ||{}).value || '',
-                invoice_number: (document.getElementById(`e-num-${idx}`)    ||{}).value || '',
-                buyer:          (document.getElementById(`e-buyer-${idx}`)  ||{}).value || '',
-                supplier:       (document.getElementById(`e-supplier-${idx}`)||{}).value || '',
-                tax_free_amount:(document.getElementById(`e-taxfree-${idx}`)||{}).value || '',
-                tax_amount:     (document.getElementById(`e-tax-${idx}`)    ||{}).value || '',
-                amount:         (document.getElementById(`e-amount-${idx}`) ||{}).value || '',
-            };
+            let payload;
+            if (isTrain) {
+                payload = {
+                    date:           g(`e-date-${idx}`),
+                    depart_time:    g(`e-dtime-${idx}`),
+                    train_number:   g(`e-train-${idx}`),
+                    from_station:   g(`e-from-${idx}`),
+                    to_station:     g(`e-to-${idx}`),
+                    passenger_name: g(`e-pname-${idx}`),
+                    seat:           g(`e-seat-${idx}`),
+                    seat_type:      g(`e-stype-${idx}`),
+                    price:          g(`e-price-${idx}`),
+                };
+            } else if (isContract) {
+                payload = {
+                    contract_name: g(`e-cname-${idx}`),
+                    sign_date:     g(`e-sdate-${idx}`),
+                    party_a:       g(`e-ptyA-${idx}`),
+                    party_b:       g(`e-ptyB-${idx}`),
+                    amount:        g(`e-camount-${idx}`),
+                };
+            } else {
+                payload = {
+                    date:           g(`e-date-${idx}`),
+                    invoice_number: g(`e-num-${idx}`),
+                    buyer:          g(`e-buyer-${idx}`),
+                    supplier:       g(`e-supplier-${idx}`),
+                    tax_free_amount:g(`e-taxfree-${idx}`),
+                    tax_amount:     g(`e-tax-${idx}`),
+                    amount:         g(`e-amount-${idx}`),
+                };
+            }
 
             const btn = document.querySelector(`#edit-form-${idx} .btn-save`);
-            btn.disabled = true;
-            btn.textContent = '⏳ 保存中...';
+            btn.disabled = true; btn.textContent = '⏳ 保存中...';
 
             fetch(`/api/update/${currentSessionId}/${idx}`, {
                 method: 'POST',
@@ -1165,27 +1220,33 @@
             .then(r => r.json())
             .then(res => {
                 if (res.error) { showStatus(`❌ ${res.error}`, 'error'); return; }
-                const d = res.data;
+                const d   = res.data;
+                const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
                 document.getElementById(`newname-${idx}`).textContent = '📁 ' + res.new_name;
+
                 if (res.doc_type === 'train') {
-                    const setT = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-                    setT(`v-train-${idx}`, d.train_number || '-');
-                    setT(`v-from-${idx}`,  d.from_station  || '?');
-                    setT(`v-to-${idx}`,    d.to_station    || '?');
-                    setT(`v-date-${idx}`,  d.date  || '-');
-                    setT(`v-dtime-${idx}`, d.depart_time || '-');
-                    setT(`v-name-${idx}`,  d.passenger_name || '-');
-                    setT(`v-seat-${idx}`,  (d.seat || '-') + (d.seat_type ? ` (${d.seat_type})` : ''));
-                    setT(`v-price-${idx}`, d.price ? d.price + ' 元' : '-');
+                    set(`v-train-${idx}`, d.train_number || '-');
+                    set(`v-from-${idx}`,  d.from_station  || '?');
+                    set(`v-to-${idx}`,    d.to_station    || '?');
+                    set(`v-date-${idx}`,  d.date  || '-');
+                    set(`v-dtime-${idx}`, d.depart_time || '-');
+                    set(`v-name-${idx}`,  d.passenger_name || '-');
+                    set(`v-seat-${idx}`,  (d.seat || '-') + (d.seat_type ? ` (${d.seat_type})` : ''));
+                    set(`v-price-${idx}`, d.price ? d.price + ' 元' : '-');
+                } else if (res.doc_type === 'contract') {
+                    set(`v-cname-${idx}`,  d.contract_name || '-');
+                    set(`v-sdate-${idx}`,  d.sign_date || '-');
+                    set(`v-ptyA-${idx}`,   d.party_a || '-');
+                    set(`v-ptyB-${idx}`,   d.party_b || '-');
+                    set(`v-camount-${idx}`,d.amount ? d.amount + ' 元' : '-');
                 } else {
-                    const setI = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-                    setI(`v-date-${idx}`,     d.date || '-');
-                    setI(`v-num-${idx}`,      d.invoice_number || '-');
-                    setI(`v-buyer-${idx}`,    d.buyer || '-');
-                    setI(`v-supplier-${idx}`, d.supplier || '-');
-                    setI(`v-taxfree-${idx}`,  d.tax_free_amount ? d.tax_free_amount + ' 元' : '-');
-                    setI(`v-tax-${idx}`,      d.tax_amount ? d.tax_amount + ' 元' : '-');
-                    setI(`v-amount-${idx}`,   d.amount ? d.amount + ' 元' : '-');
+                    set(`v-date-${idx}`,     d.date || '-');
+                    set(`v-num-${idx}`,      d.invoice_number || '-');
+                    set(`v-buyer-${idx}`,    d.buyer || '-');
+                    set(`v-supplier-${idx}`, d.supplier || '-');
+                    set(`v-taxfree-${idx}`,  d.tax_free_amount ? d.tax_free_amount + ' 元' : '-');
+                    set(`v-tax-${idx}`,      d.tax_amount ? d.tax_amount + ' 元' : '-');
+                    set(`v-amount-${idx}`,   d.amount ? d.amount + ' 元' : '-');
                 }
                 form.classList.remove('active');
                 showStatus('✅ 已保存，文件名已同步更新', 'success');

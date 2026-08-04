@@ -135,8 +135,104 @@ class InvoiceExtractor:
         except Exception as e:
             raise Exception(f"提取失败: {e}")
 
+    # ------------------------------------------------------------------ #
+    # 文本预处理：修复 OCR 两栏布局拆行 & 统一各发票类型的字段标签
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """
+        修复常见 OCR 问题：
+        1. 两栏发票中购/销方标签被单独拆成一行，下一行才是"名称:"
+           "购\n名称:XX" → "购买方名称:XX"
+        2. "销售方信息" 作为大标题，下面跟"名称:" 字段
+        3. 机动车/航空/其他发票格式兼容
+        """
+        lines = text.split('\n')
+        out = []
+        i = 0
+        while i < len(lines):
+            raw = lines[i]
+            stripped = raw.strip()
+            # 向前看：下一行是否以"名称:" 开头（含OCR常见误读 "1称:" / "l称:"）
+            if i + 1 < len(lines):
+                nxt = lines[i + 1].strip()
+                nxt_is_name = bool(re.match(r'[名1l][称称][：:﹕]', nxt))
+                if nxt_is_name:
+                    # 孤立的购方标签
+                    if re.fullmatch(r'购(?:买方?|方)?(?:信息)?', stripped):
+                        out.append('购买方' + nxt)
+                        i += 2
+                        continue
+                    # 孤立的销方标签
+                    if re.fullmatch(r'销(?:售方?|方)?(?:信息)?', stripped):
+                        out.append('销售方' + nxt)
+                        i += 2
+                        continue
+            # 机动车发票：把"销货单位"/"购货单位"统一为标准标签
+            stripped = re.sub(r'销货单位名称', '销售方名称', stripped)
+            stripped = re.sub(r'购货单位名称', '购买方名称', stripped)
+            stripped = re.sub(r'销货单位[：:]', '销售方名称：', stripped)
+            stripped = re.sub(r'购货单位[：:]', '购买方名称：', stripped)
+            # 航空行程单：把"旅客姓名"当购买方
+            # (保持原行，由后续专项逻辑处理)
+            out.append(raw[:raw.find(lines[i].lstrip())] + stripped if stripped != raw.strip() else raw)
+            i += 1
+        return '\n'.join(out)
+
+    def _extract_special_invoice(self, text: str, result: dict) -> bool:
+        """
+        识别并提取特殊发票类型，返回 True 表示已处理（后续可跳过通用逻辑）。
+        支持：机动车销售统一发票、航空运输电子客票行程单、出租车发票、定额发票
+        """
+        # ---- 机动车销售统一发票 ----
+        if re.search(r'机动车销售统一发票|机动车(?:出售|发票)', text):
+            result['invoice_type'] = '机动车发票'
+            # 购货单位 / 销货单位（已在_normalize_text中替换为标准标签，无需重复处理）
+            return False   # 让通用逻辑继续跑购买方/销售方
+
+        # ---- 航空运输电子客票行程单 ----
+        if re.search(r'航空运输电子客票|行程单|旅客姓名|电子客票', text):
+            result['invoice_type'] = '航空行程单'
+            # 旅客姓名 → buyer
+            m = re.search(r'旅客姓名[：:\s]+([^\n\s]{2,10})', text)
+            if m:
+                result['buyer'] = m.group(1).strip()
+            # 出发地-目的地 → supplier 位置存路线（用于文件名）
+            dep = re.search(r'出发地[：:\s]+([^\n\s]{2,8})', text)
+            arr = re.search(r'目的地[：:\s]+([^\n\s]{2,8})', text)
+            if dep and arr:
+                result['supplier'] = f"{dep.group(1).strip()}-{arr.group(1).strip()}"
+            elif dep:
+                result['supplier'] = dep.group(1).strip()
+            # 票价
+            m = re.search(r'(?:票价|合计)[：:\s]*[¥￥]?\s*(\d+(?:\.\d{1,2})?)', text)
+            if m:
+                result['amount'] = f"{float(m.group(1)):.2f}"
+            return True
+
+        # ---- 出租车发票 ----
+        if re.search(r'出租汽车|出租车发票|计价器', text):
+            result['invoice_type'] = '出租车发票'
+            m = re.search(r'(?:金额|合计)[：:\s]*[¥￥]?\s*(\d+(?:\.\d{1,2})?)', text)
+            if m:
+                result['amount'] = f"{float(m.group(1)):.2f}"
+            return True
+
+        # ---- 定额发票 ----
+        if re.search(r'定额发票|监制(?:章|机关)', text) and len(text) < 400:
+            result['invoice_type'] = '定额发票'
+            m = re.search(r'[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*元', text)
+            if m:
+                result['amount'] = f"{float(m.group(1)):.2f}"
+            return True
+
+        return False
+
     def _extract_fields(self, text: str) -> dict:
         """字段提取 - 改进版，优先用标签，备选用通用模式"""
+        # 第一步：修复 OCR 拆行 & 统一标签
+        text = self._normalize_text(text)
+
         result = {
             "date": None,
             "invoice_number": None,
@@ -145,7 +241,11 @@ class InvoiceExtractor:
             "amount": None,        # 价税合计
             "tax_free_amount": None,  # 合计金额（不含税）
             "tax_amount": None,    # 合计税额
+            "invoice_type": None,  # 发票类型（特殊发票用）
         }
+
+        # 第二步：特殊发票类型优先处理
+        special_done = self._extract_special_invoice(text, result)
 
         # === 日期 ===
         # 优先匹配有明确标签的日期，再匹配年月日格式，最后才用紧凑数字（严格校验避免误匹配发票号）
@@ -225,6 +325,8 @@ class InvoiceExtractor:
             name = re.split(r'(?:纳税人|识别号|地址[、，,]|开户|电话|统一社会|监制机关|主管税务)', name)[0]
             # 去掉末尾长数字串（税号等）
             name = re.sub(r'\s*\d{8,}.*$', '', name)
+            # 去掉括号内的企业类型说明（如"(个体工商户)"、"(个人)"）
+            name = re.sub(r'\s*[（(]\s*(?:个体工商户|个人独资|自然人|个人)\s*[）)]', '', name)
             # 去掉末尾标点/空白
             name = re.sub(r'[：:\s，,。.]+$', '', name).strip()
             # 必须含中文
@@ -490,11 +592,29 @@ _TRAIN_KEYWORDS = re.compile(
 # 修复：去掉 \b，在中文环境下 \b 不能正确匹配（中文字符属于 \w，无法形成边界）
 _TRAIN_NUMBER_RE = re.compile(r'(?<![A-Z\d])([GDTZKCY]\d{1,4})(?!\d)')
 
+# 合同关键词（用于类型检测）
+_CONTRACT_PARTY_A  = re.compile(r'甲\s*方|买\s*方|委\s*托\s*方|发\s*包\s*方|采\s*购\s*方|招\s*标\s*人')
+_CONTRACT_PARTY_B  = re.compile(r'乙\s*方|卖\s*方|承\s*包\s*方|承\s*接\s*方|供\s*货\s*方|中\s*标\s*人')
+_CONTRACT_STRONG   = re.compile(
+    r'本\s*合\s*同|本\s*协\s*议|合\s*同\s*编\s*号|甲\s*乙\s*双\s*方|买\s*卖\s*双\s*方|'
+    r'委\s*托\s*方|发\s*包\s*方|合\s*同\s*金\s*额|合\s*同\s*总\s*额|合\s*同\s*总\s*价|'
+    r'平\s*等\s*自\s*愿|协\s*商\s*一\s*致|合\s*同\s*协\s*议\s*书|货\s*物\s*采\s*购\s*合\s*同|'
+    r'采\s*购\s*合\s*同|服\s*务\s*合\s*同|工\s*程\s*合\s*同|建\s*设\s*工\s*程\s*合\s*同'
+)
+
 
 def detect_doc_type(text: str) -> str:
-    """根据 OCR 文本判断是火车票还是发票，返回 'train' 或 'invoice'"""
+    """根据 OCR 文本判断是火车票/合同/发票，返回 'train'/'contract'/'invoice'"""
+    # 1. 强火车票关键词（优先级最高）
     if _TRAIN_KEYWORDS.search(text):
         return 'train'
+    # 2. 合同强关键词（优先于弱车次号检测，防止项目编号被误判为车次）
+    has_a = bool(_CONTRACT_PARTY_A.search(text))
+    has_b = bool(_CONTRACT_PARTY_B.search(text))
+    has_s = bool(_CONTRACT_STRONG.search(text))
+    if has_s or (has_a and has_b):
+        return 'contract'
+    # 3. 弱车次号检测（仅在无合同信号时才判断）
     if _TRAIN_NUMBER_RE.search(text):
         return 'train'
     return 'invoice'
@@ -895,6 +1015,280 @@ class TrainTicketExtractor:
         return result
 
 
+# ======================== 合同提取 ========================
+
+def _abbreviate_party(name: str) -> str:
+    """从公司/单位名称提取 4-6 个关键字（去除括号地名和通用后缀）"""
+    if not name:
+        return ''
+    # 去除括号内的地名（如"(苏州)"、"（上海）"）
+    name = re.sub(r'[（(][^）)]{1,8}[）)]', '', name).strip()
+    name = re.sub(r'\s+', '', name)
+
+    # 按从长到短的顺序尝试剥离法律后缀（避免短后缀先匹配导致漏剥）
+    _SUFFIXES = [
+        '有限责任公司', '股份有限公司', '集团有限公司', '集团公司',
+        '总公司', '分公司', '有限公司',
+    ]
+    for sfx in _SUFFIXES:
+        if name.endswith(sfx):
+            candidate = name[:-len(sfx)]
+            if len(candidate) >= 2:   # 剥离后名称至少保留2字
+                name = candidate
+            break
+
+    # 若仍超6字，取前6字
+    if len(name) > 6:
+        name = name[:6]
+    return name
+
+
+class ContractExtractor:
+    """合同 OCR 字段提取（支持甲方/乙方 和 买方/卖方 等多种格式）"""
+
+    def _extract_fields(self, text: str) -> dict:
+        result = {
+            'contract_name': '',
+            'sign_date':     '',
+            'party_a':       '',
+            'party_b':       '',
+            'amount':        '',
+        }
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        self._extract_contract_name(lines, text, result)
+        self._extract_sign_date(lines, text, result)
+        self._extract_parties(lines, text, result)
+        self._extract_amount(lines, text, result)
+        return result
+
+    # ---- 合同名称 ----
+    def _extract_contract_name(self, lines, text, result):
+        # 1. 标注字段
+        for line in lines:
+            m = re.search(r'(?:合同名称|协议名称|项目名称)[：:]\s*(.{2,40})', line)
+            if m:
+                name = re.sub(r'\s+', '', m.group(1)).strip()
+                name = re.sub(r'[（(].*?[）)]', '', name).strip()
+                if name and len(name) >= 2:
+                    result['contract_name'] = name[:20]
+                    return
+        # 2. 标题行（前10行，含"合同"/"协议"词）
+        for line in lines[:10]:
+            clean = re.sub(r'[《》【】\[\]（(）)\s]+', '', line)
+            if 2 < len(clean) <= 20 and re.search(r'合同|协议书', clean):
+                if clean not in ('合同', '协议书', '协议', '本合同', '本协议'):
+                    result['contract_name'] = clean
+                    return
+        # 3. 全文最先出现的 "XX合同" / "XX协议书"
+        m = re.search(r'[\u4e00-\u9fff]{2,12}(?:采购合同|服务合同|工程合同|合同|协议书)', text)
+        if m:
+            result['contract_name'] = m.group(0)[:20]
+
+    # ---- 签订日期 ----
+    def _extract_sign_date(self, lines, text, result):
+        pats = [
+            r'(?:签订|签署|签约|合同)\s*[日期时间]*\s*[：:\s]+(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日',
+            r'于\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日',
+            r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日',
+            r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})',
+        ]
+        for pat in pats:
+            m = re.search(pat, text)
+            if m:
+                result['sign_date'] = (
+                    f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+                )
+                return
+
+    # ---- 甲方/乙方（买方/卖方） ----
+    def _extract_parties(self, lines, text, result):
+        # 模式：关键词 + 可选冒号/空格 + 名称
+        A_KW = r'(?:甲\s*方|买\s*方|委\s*托\s*方|发\s*包\s*方|采\s*购\s*方|招\s*标\s*人)'
+        B_KW = r'(?:乙\s*方|卖\s*方|承\s*包\s*方|承\s*接\s*方|供\s*货\s*方|中\s*标\s*人)'
+        # 支持 "买方 单位全称 XXX" 和 "买方：XXX" 两种格式
+        a_pats = [
+            A_KW + r'(?:\s*单位全称|\s*名称|\s*（盖章）|\s*\(盖章\))?\s*[：:\s]+([^\n]{2,35})',
+        ]
+        b_pats = [
+            B_KW + r'(?:\s*单位全称|\s*名称|\s*（盖章）|\s*\(盖章\))?\s*[：:\s]+([^\n]{2,35})',
+        ]
+
+        def _clean(raw):
+            val = re.sub(r'[（(][^）)]{1,8}[）)]', '', raw).strip()
+            val = re.sub(r'\s+', '', val)
+            # 去除捕获到的关键词前缀（防止把下一行关键词算进来）
+            val = re.split(r'甲方|乙方|买方|卖方|承包方|委托方|招标人|中标人', val)[0]
+            return val[:30]
+
+        for line in lines:
+            if not result['party_a']:
+                for pat in a_pats:
+                    m = re.search(pat, line)
+                    if m:
+                        v = _clean(m.group(1))
+                        if len(v) >= 2:
+                            result['party_a'] = v
+                            break
+            if not result['party_b']:
+                for pat in b_pats:
+                    m = re.search(pat, line)
+                    if m:
+                        v = _clean(m.group(1))
+                        if len(v) >= 2:
+                            result['party_b'] = v
+                            break
+            if result['party_a'] and result['party_b']:
+                break
+
+        # 兜底：宽松扫描（针对OCR排版混乱的情况）
+        if not result['party_a']:
+            m = re.search(A_KW + r'[\s：:]+([^\n（(]{2,30})', text)
+            if m:
+                result['party_a'] = _clean(m.group(1))
+        if not result['party_b']:
+            m = re.search(B_KW + r'[\s：:]+([^\n（(]{2,30})', text)
+            if m:
+                result['party_b'] = _clean(m.group(1))
+
+    # ---- 合同金额 ----
+    def _extract_amount(self, lines, text, result):
+        amount_pats = [
+            # 合同总额/合同金额/合同价 + 数字
+            (r'(?:合同[总]?[额价款金]|总金额|总价款|合同总价|合同价款|价款总额)'
+             r'[^0-9¥￥]{0,15}[¥￥]?\s*(\d[\d,，]*\.?\d*)\s*(万元|元)?', True),
+            # 人民币 + 数字
+            (r'人民币\s*[¥￥]?\s*(\d[\d,，]*\.?\d+)\s*(万元|元)?', True),
+            # ¥/￥ + 数字
+            (r'[¥￥]\s*(\d[\d,，]*\.?\d+)\s*(万元|元)?', True),
+            # 数字 + 万元（宽松兜底）
+            (r'(\d[\d,，]{1,8}\.?\d*)\s*(万元)', True),
+        ]
+        def _parse(raw_num, unit):
+            try:
+                v = float(raw_num.replace(',', '').replace('，', ''))
+                if unit and '万' in unit:
+                    v *= 10000
+                return f'{v:.2f}'
+            except Exception:
+                return raw_num
+
+        for line in lines:
+            for pat, _ in amount_pats:
+                m = re.search(pat, line)
+                if m:
+                    unit = m.group(2) if m.lastindex and m.lastindex >= 2 else ''
+                    result['amount'] = _parse(m.group(1), unit or '')
+                    return
+        # 全文兜底
+        for pat, _ in amount_pats:
+            m = re.search(pat, text)
+            if m:
+                unit = m.group(2) if m.lastindex and m.lastindex >= 2 else ''
+                result['amount'] = _parse(m.group(1), unit or '')
+                return
+
+
+def generate_contract_filename(data: dict, original_ext: str) -> str:
+    """生成合同新文件名：签订日期_合同名称_甲方关键字_乙方关键字_金额元.ext"""
+    date          = data.get('sign_date') or '0000-01-01'
+    contract_name = (data.get('contract_name') or '合同')[:15]
+    party_a_abbr  = _abbreviate_party(data.get('party_a') or '')
+    party_b_abbr  = _abbreviate_party(data.get('party_b') or '')
+    amount        = data.get('amount') or ''
+
+    parts = [date, contract_name]
+    if party_a_abbr:
+        parts.append(party_a_abbr)
+    if party_b_abbr:
+        parts.append(party_b_abbr)
+    if amount:
+        try:
+            parts.append(f'{float(amount):.0f}元' if float(amount) == int(float(amount))
+                         else f'{amount}元')
+        except Exception:
+            parts.append(f'{amount}元')
+
+    new_name = '_'.join(parts) + original_ext
+    new_name = re.sub(r'[\\/:*?"<>|]', '', new_name)
+    new_name = re.sub(r'_+', '_', new_name).strip('_')
+    return new_name or f"contract_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
+
+
+def _extract_text_from_docx(docx_path: str) -> str:
+    """从 Word (.docx) 文件提取纯文本"""
+    try:
+        import docx as _docx
+        doc = _docx.Document(docx_path)
+        return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+    except Exception:
+        return ''
+
+
+def _pdf_contract_pages_text(pdf_path: str, reader, inv_extractor, max_pages: int = 8) -> str:
+    """对合同 PDF 多页做 OCR，合并文本（首页 + 前max_pages页）"""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        combined = []
+        for i in range(min(max_pages, len(doc))):
+            page = doc[i]
+            mat  = fitz.Matrix(2, 2)
+            pix  = page.get_pixmap(matrix=mat)
+            from PIL import Image
+            import io as _io
+            img = Image.open(_io.BytesIO(pix.tobytes('png')))
+            img_arr = inv_extractor._image_file_to_array.__func__
+            # 直接转 numpy
+            import numpy as np
+            img_np = np.array(img.convert('RGB'))
+            img_np = inv_extractor._preprocess_image(img_np)
+            results = reader.readtext(img_np, detail=0)
+            combined.append('\n'.join(results))
+        return '\n'.join(combined)
+    except Exception as e:
+        return ''
+
+
+def _image_to_pdf(image_path: str, output_pdf_path: str):
+    """将图片文件转为单页 PDF"""
+    from PIL import Image as _PIL_Image
+    img = _PIL_Image.open(image_path).convert('RGB')
+    img.save(output_pdf_path, 'PDF', resolution=150)
+
+
+_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif'}
+
+
+def _resolve_output_ext(orig_ext: str, doc_type: str) -> str:
+    """决定输出文件扩展名。
+    合同：Word→Word，图片→PDF，PDF→PDF。
+    发票/火车票：保持原格式不变。"""
+    if doc_type == 'contract':
+        if orig_ext in ('.docx', '.doc'):
+            return orig_ext          # Word 合同保持 Word
+        if orig_ext in _IMAGE_EXTS:
+            return '.pdf'            # 图片合同转为 PDF
+    return orig_ext                  # 其他格式原样
+
+
+def _generate_any_filename(data: dict, doc_type: str, out_ext: str) -> str:
+    """根据文档类型选择对应的命名函数"""
+    if doc_type == 'train':
+        return generate_train_filename(data, out_ext)
+    if doc_type == 'contract':
+        return generate_contract_filename(data, out_ext)
+    return generate_filename(data, out_ext)
+
+
+def _save_file(src_path: str, src_ext: str, dst_path: str,
+               out_ext: str, doc_type: str):
+    """将源文件保存到 dst_path，必要时做格式转换（图片合同→PDF）。"""
+    if doc_type == 'contract' and src_ext in _IMAGE_EXTS and out_ext == '.pdf':
+        _image_to_pdf(src_path, dst_path)
+    else:
+        shutil.copy(src_path, dst_path)
+
+
 # ======================== Flask 应用 ========================
 
 app = Flask(__name__, template_folder='templates')
@@ -958,21 +1352,28 @@ def _pdf_direct_text(pdf_path: str) -> str | None:
 
 
 def smart_extract(file_path: str, reader) -> tuple:
-    """自动判断发票或火车票，返回 (data_dict, doc_type)。
-    PDF 优先用 PyMuPDF 直提矢量文本（精度远高于 OCR），OCR 仅作扫描图兜底。"""
-    inv   = InvoiceExtractor(reader)
-    train = TrainTicketExtractor(reader)
+    """自动判断发票/火车票/合同，返回 (data_dict, doc_type)。
+    PDF 优先用 PyMuPDF 直提矢量文本；Word 用 python-docx；图片 OCR 兜底。"""
+    inv      = InvoiceExtractor(reader)
+    train    = TrainTicketExtractor(reader)
+    contract = ContractExtractor()
 
     fp  = Path(file_path)
     ext = fp.suffix.lower()
 
     text = None  # 最终用于字段提取的文本
 
-    # === 1. 矢量 PDF 优先直提文本 ===
-    if ext == '.pdf':
+    # === 1. Word 文件：直接提取文本 ===
+    if ext in ('.docx', '.doc'):
+        text = _extract_text_from_docx(str(fp))
+        if not text:
+            raise Exception("无法读取 Word 文件内容")
+
+    # === 2. 矢量 PDF 优先直提文本 ===
+    elif ext == '.pdf':
         text = _pdf_direct_text(str(fp))
 
-    # === 2. 无法直提 / 非 PDF → OCR ===
+    # === 3. 无法直提 / 图片 → 单页 OCR（第1页预判类型）===
     if not text:
         if ext == '.pdf':
             img = inv._pdf_to_image(str(fp))
@@ -986,12 +1387,27 @@ def smart_extract(file_path: str, reader) -> tuple:
         results = reader.readtext(img, detail=0)
         if not results:
             raise Exception("OCR 无法识别")
-        text = '\n'.join(results)
+        page1_text = '\n'.join(results)
+
+        # 若第1页已判断为合同，追加后续多页 OCR（合同关键信息常在后页）
+        if detect_doc_type(page1_text) == 'contract' and ext == '.pdf':
+            extra = _pdf_contract_pages_text(str(fp), reader, inv, max_pages=8)
+            text = page1_text + '\n' + extra if extra else page1_text
+        else:
+            text = page1_text
+
+    # 若直提的文本判断为合同，补充多页 OCR（矢量PDF合同文本可能不完整）
+    if text and detect_doc_type(text) == 'contract' and ext == '.pdf':
+        extra = _pdf_contract_pages_text(str(fp), reader, inv, max_pages=8)
+        if extra:
+            text = text + '\n' + extra
 
     doc_type = detect_doc_type(text)
 
     if doc_type == 'train':
         fields = train._extract_fields(text, fp.stem)
+    elif doc_type == 'contract':
+        fields = contract._extract_fields(text)
     else:
         fields = inv._extract_fields(text)
         # 从文件名补充发票缺失字段
@@ -1030,7 +1446,10 @@ def upload_file():
                 continue
 
             ext = Path(file.filename).suffix.lower()
-            allowed_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.zip'}
+            allowed_ext = {
+                '.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif',
+                '.docx', '.doc', '.zip'
+            }
 
             if ext not in allowed_ext:
                 results.append({'filename': file.filename, 'status': 'error', 'error': '不支持的格式'})
@@ -1046,12 +1465,11 @@ def upload_file():
                     results.extend(zip_results)
                 else:
                     data, doc_type = smart_extract(temp_path, reader)
-                    new_name = (generate_train_filename(data, ext)
-                                if doc_type == 'train'
-                                else generate_filename(data, ext))
+                    out_ext = _resolve_output_ext(ext, doc_type)
+                    new_name = _generate_any_filename(data, doc_type, out_ext)
 
                     new_path = os.path.join(session_dir, new_name)
-                    shutil.copy(temp_path, new_path)
+                    _save_file(temp_path, ext, new_path, out_ext, doc_type)
 
                     results.append({
                         'filename': file.filename,
@@ -1074,7 +1492,7 @@ def upload_file():
 
 
 def process_zip_file(zip_path: str, reader, session_dir: str) -> list:
-    """处理 ZIP 文件，自动识别发票/火车票"""
+    """处理 ZIP 文件，自动识别发票/火车票/合同"""
     results      = []
     temp_extract = tempfile.mkdtemp()
 
@@ -1082,7 +1500,10 @@ def process_zip_file(zip_path: str, reader, session_dir: str) -> list:
         with zipfile.ZipFile(zip_path, 'r') as z:
             z.extractall(temp_extract)
 
-        allowed_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif'}
+        allowed_ext = {
+            '.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif',
+            '.docx', '.doc'
+        }
 
         for root, dirs, files in os.walk(temp_extract):
             for file in sorted(files):
@@ -1091,12 +1512,10 @@ def process_zip_file(zip_path: str, reader, session_dir: str) -> list:
                     file_path = os.path.join(root, file)
                     try:
                         data, doc_type = smart_extract(file_path, reader)
-                        new_name = (generate_train_filename(data, ext)
-                                    if doc_type == 'train'
-                                    else generate_filename(data, ext))
-
+                        out_ext  = _resolve_output_ext(ext, doc_type)
+                        new_name = _generate_any_filename(data, doc_type, out_ext)
                         new_path = os.path.join(session_dir, new_name)
-                        shutil.copy(file_path, new_path)
+                        _save_file(file_path, ext, new_path, out_ext, doc_type)
 
                         results.append({
                             'filename': file,
@@ -1171,7 +1590,7 @@ def download_single_file(session_id, item_idx):
 
 
 def _build_csv_bytes(results: list) -> bytes:
-    """将 result 列表序列化为带 BOM 的 UTF-8 CSV bytes（支持发票 + 火车票）"""
+    """将 result 列表序列化为带 BOM 的 UTF-8 CSV bytes（支持发票 + 火车票 + 合同）"""
     import csv
     output = io.StringIO()
     output.write('\ufeff')
@@ -1182,34 +1601,49 @@ def _build_csv_bytes(results: list) -> bytes:
         '发票号码', '购买方', '销售方', '金额（不含税）', '税额', '价税合计',
         # 火车票专属
         '车次', '出发站', '到达站', '乘客姓名', '座位', '座位类型', '票价',
+        # 合同专属
+        '合同名称', '甲方', '乙方', '合同金额',
         '错误信息'
     ])
 
-    total_invoice = total_train = 0.0
+    total_invoice = total_train = total_contract = 0.0
     success_count = fail_count = 0
+    EMPTY6 = [''] * 6
+    EMPTY7 = [''] * 7
+    EMPTY4 = [''] * 4
 
     for item in results:
         if item['status'] == 'success':
-            d        = item.get('data') or {}
-            dtype    = item.get('doc_type', 'invoice')
-            is_train = dtype == 'train'
+            d     = item.get('data') or {}
+            dtype = item.get('doc_type', 'invoice')
 
-            if is_train:
+            if dtype == 'train':
                 price = d.get('price', '')
                 writer.writerow([
                     item.get('filename', ''), item.get('new_name', ''), '成功', '🚄 火车票',
                     d.get('date', ''),
-                    '', '', '', '', '', '',          # 发票列留空
-                    d.get('train_number', ''),
-                    d.get('from_station', ''),
-                    d.get('to_station', ''),
-                    d.get('passenger_name', ''),
-                    d.get('seat', ''),
-                    d.get('seat_type', ''),
-                    price, ''
+                    *EMPTY6,                          # 发票列留空
+                    d.get('train_number', ''), d.get('from_station', ''),
+                    d.get('to_station', ''), d.get('passenger_name', ''),
+                    d.get('seat', ''), d.get('seat_type', ''), price,
+                    *EMPTY4, ''                        # 合同列留空 + 错误
                 ])
                 try: total_train += float(price) if price else 0
                 except ValueError: pass
+
+            elif dtype == 'contract':
+                amount = d.get('amount', '')
+                writer.writerow([
+                    item.get('filename', ''), item.get('new_name', ''), '成功', '📋 合同',
+                    d.get('sign_date', ''),
+                    *EMPTY6,                          # 发票列留空
+                    *EMPTY7,                          # 火车票列留空
+                    d.get('contract_name', ''), d.get('party_a', ''),
+                    d.get('party_b', ''), amount, ''
+                ])
+                try: total_contract += float(amount) if amount else 0
+                except ValueError: pass
+
             else:
                 tax_free = d.get('tax_free_amount', '')
                 tax      = d.get('tax_amount', '')
@@ -1219,8 +1653,8 @@ def _build_csv_bytes(results: list) -> bytes:
                     d.get('date', ''),
                     d.get('invoice_number', ''), d.get('buyer', ''), d.get('supplier', ''),
                     tax_free, tax, amount,
-                    '', '', '', '', '', '', '',      # 火车票列留空
-                    ''
+                    *EMPTY7,                          # 火车票列留空
+                    *EMPTY4, ''                        # 合同列留空 + 错误
                 ])
                 try: total_invoice += float(amount) if amount else 0
                 except ValueError: pass
@@ -1229,8 +1663,7 @@ def _build_csv_bytes(results: list) -> bytes:
         else:
             writer.writerow([
                 item.get('filename', ''), '', '失败', '', '',
-                '', '', '', '', '', '',
-                '', '', '', '', '', '', '',
+                *EMPTY6, *EMPTY7, *EMPTY4,
                 item.get('error', '')
             ])
             fail_count += 1
@@ -1241,26 +1674,28 @@ def _build_csv_bytes(results: list) -> bytes:
         '', '', '', '',
         '', '', '', '', '', f'{total_invoice:.2f}',
         '', '', '', '', '', '', f'{total_train:.2f}',
-        ''
+        '', '', '', f'{total_contract:.2f}', ''
     ])
     return output.getvalue().encode('utf-8-sig')
 
 
 def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> bytes:
-    """将 result 列表序列化为带格式的 .xlsx bytes（支持发票 + 火车票）"""
+    """将 result 列表序列化为带格式的 .xlsx bytes（支持发票 + 火车票 + 合同）"""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = '汇总表'
 
     # ---- 颜色 & 样式常量 ----
-    C_INVOICE_HDR = 'FF276749'   # 深绿（发票表头）
-    C_TRAIN_HDR   = 'FF2B6CB0'   # 深蓝（火车票表头）
-    C_META_HDR    = 'FF4A5568'   # 深灰（公共表头）
-    C_INVOICE_ROW = 'FFE6F4EA'   # 浅绿（发票行底色）
-    C_TRAIN_ROW   = 'FFE8F0FE'   # 浅蓝（火车票行底色）
-    C_FAIL_ROW    = 'FFFFF3CD'   # 浅黄（失败行底色）
-    C_SUM_ROW     = 'FFFFF8E1'   # 浅橙（汇总行底色）
-    WHITE         = 'FFFFFFFF'
+    C_INVOICE_HDR  = 'FF276749'   # 深绿（发票表头）
+    C_TRAIN_HDR    = 'FF2B6CB0'   # 深蓝（火车票表头）
+    C_CONTRACT_HDR = 'FF6B21A8'   # 深紫（合同表头）
+    C_META_HDR     = 'FF4A5568'   # 深灰（公共表头）
+    C_INVOICE_ROW  = 'FFE6F4EA'   # 浅绿（发票行底色）
+    C_TRAIN_ROW    = 'FFE8F0FE'   # 浅蓝（火车票行底色）
+    C_CONTRACT_ROW = 'FFF3E8FE'   # 浅紫（合同行底色）
+    C_FAIL_ROW     = 'FFFFF3CD'   # 浅黄（失败行底色）
+    C_SUM_ROW      = 'FFFFF8E1'   # 浅橙（汇总行底色）
+    WHITE          = 'FFFFFFFF'
 
     thin = Side(style='thin', color='FFCCCCCC')
     bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -1280,8 +1715,30 @@ def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> byte
     def left():
         return Alignment(horizontal='left', vertical='center', wrap_text=True)
 
+    # ---- 表头定义（列索引 1-based）----
+    # 公共(1-5) | 发票(6-11) | 火车票(12-18) | 合同(19-22) | 错误(23)
+    HEADERS = [
+        '原文件名', '新文件名', '状态', '类型', '日期',
+        '发票号码', '购买方', '销售方', '金额(不含税)', '税额', '价税合计',
+        '车次', '出发站', '到达站', '乘客姓名', '座位', '座位类型', '票价',
+        '合同名称', '甲方', '乙方', '合同金额',
+        '错误信息',
+    ]
+    NCOLS = len(HEADERS)  # 23
+    COL_WIDTHS = [26, 36, 8, 10, 12,
+                  18, 20, 20, 14, 12, 12,
+                  10, 14, 14, 14, 14, 10, 10,
+                  20, 16, 16, 14,
+                  20]
+    HDR_COLORS = {
+        **{i: C_META_HDR     for i in range(1, 6)},
+        **{i: C_INVOICE_HDR  for i in range(6, 12)},
+        **{i: C_TRAIN_HDR    for i in range(12, 19)},
+        **{i: C_CONTRACT_HDR for i in range(19, 23)},
+        23: C_META_HDR,
+    }
+
     # ---- 标题行 ----
-    NCOLS = 20
     ws.merge_cells(f'A1:{get_column_letter(NCOLS)}1')
     title_cell = ws['A1']
     title_cell.value     = title
@@ -1290,30 +1747,6 @@ def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> byte
     title_cell.alignment = center()
     ws.row_dimensions[1].height = 32
 
-    # ---- 表头（第2行）----
-    HEADERS = [
-        '原文件名', '新文件名', '状态', '类型', '日期',
-        # 发票专属（6列）
-        '发票号码', '购买方', '销售方', '金额(不含税)', '税额', '价税合计',
-        # 火车票专属（7列）
-        '车次', '出发站', '到达站', '乘客姓名', '座位', '座位类型', '票价',
-        '错误信息', '备注',
-    ]
-    # 列宽
-    COL_WIDTHS = [26, 36, 8, 10, 12,
-                  18, 20, 20, 14, 12, 12,
-                  10, 14, 14, 14, 14, 10, 10,
-                  20, 8]
-
-    # 表头颜色分组
-    HDR_COLORS = {
-        1: C_META_HDR, 2: C_META_HDR, 3: C_META_HDR, 4: C_META_HDR, 5: C_META_HDR,
-        6: C_INVOICE_HDR, 7: C_INVOICE_HDR, 8: C_INVOICE_HDR,
-        9: C_INVOICE_HDR, 10: C_INVOICE_HDR, 11: C_INVOICE_HDR,
-        12: C_TRAIN_HDR, 13: C_TRAIN_HDR, 14: C_TRAIN_HDR,
-        15: C_TRAIN_HDR, 16: C_TRAIN_HDR, 17: C_TRAIN_HDR, 18: C_TRAIN_HDR,
-        19: C_META_HDR, 20: C_META_HDR,
-    }
     for col_i, (hdr, width) in enumerate(zip(HEADERS, COL_WIDTHS), start=1):
         c = ws.cell(row=2, column=col_i, value=hdr)
         c.font      = hdr_font(color=WHITE)
@@ -1324,20 +1757,22 @@ def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> byte
     ws.row_dimensions[2].height = 22
 
     # ---- 数据行 ----
-    total_invoice = total_train = 0.0
+    total_invoice = total_train = total_contract = 0.0
     success_count = fail_count  = 0
     data_start_row = 3
 
     for row_i, item in enumerate(results, start=data_start_row):
-        is_train = item.get('doc_type') == 'train'
+        dtype    = item.get('doc_type', 'invoice')
         is_ok    = item['status'] == 'success'
         d        = item.get('data') or {}
 
         # 行底色
         if not is_ok:
             row_fill = fill(C_FAIL_ROW)
-        elif is_train:
+        elif dtype == 'train':
             row_fill = fill(C_TRAIN_ROW)
+        elif dtype == 'contract':
+            row_fill = fill(C_CONTRACT_ROW)
         else:
             row_fill = fill(C_INVOICE_ROW)
 
@@ -1350,66 +1785,63 @@ def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> byte
             if num_fmt:
                 c.number_format = num_fmt
 
+        def num_cell(col, val_str):
+            try:
+                v = float(val_str) if val_str else None
+                c = ws.cell(row=row_i, column=col, value=v)
+                c.font = cell_font(); c.fill = row_fill; c.border = bdr
+                c.alignment = center(); c.number_format = '#,##0.00'
+                return v or 0
+            except (ValueError, TypeError):
+                set_cell(col, val_str, align=center())
+                return 0
+
         if is_ok:
-            type_label = '火车票' if is_train else '发票'
+            # 公共列
+            type_labels = {'train': '火车票', 'contract': '合同', 'invoice': '发票'}
             set_cell(1, item.get('filename', ''))
             set_cell(2, item.get('new_name', ''), bold=True)
             set_cell(3, '成功', align=center())
-            set_cell(4, type_label, align=center())
-            set_cell(5, d.get('date', ''), align=center())
+            set_cell(4, type_labels.get(dtype, '发票'), align=center())
 
-            if is_train:
-                price_str = d.get('price', '')
-                # 发票列留空
-                for col in range(6, 12):
-                    set_cell(col, '')
+            if dtype == 'train':
+                set_cell(5, d.get('date', ''), align=center())
+                for col in range(6, 12): set_cell(col, '')
                 set_cell(12, d.get('train_number', ''), align=center())
                 set_cell(13, d.get('from_station', ''))
                 set_cell(14, d.get('to_station', ''))
                 set_cell(15, d.get('passenger_name', ''))
                 set_cell(16, d.get('seat', ''), align=center())
                 set_cell(17, d.get('seat_type', ''), align=center())
-                try:
-                    price_val = float(price_str) if price_str else None
-                    c = ws.cell(row=row_i, column=18, value=price_val)
-                    c.font = cell_font(); c.fill = row_fill; c.border = bdr
-                    c.alignment = center(); c.number_format = '#,##0.00'
-                    if price_val: total_train += price_val
-                except (ValueError, TypeError):
-                    set_cell(18, price_str, align=center())
-            else:
-                tax_free = d.get('tax_free_amount', '')
-                tax      = d.get('tax_amount', '')
-                amount   = d.get('amount', '')
-                def num_cell(col, val_str):
-                    try:
-                        v = float(val_str) if val_str else None
-                        c = ws.cell(row=row_i, column=col, value=v)
-                        c.font = cell_font(); c.fill = row_fill; c.border = bdr
-                        c.alignment = center(); c.number_format = '#,##0.00'
-                        return v or 0
-                    except (ValueError, TypeError):
-                        set_cell(col, val_str, align=center())
-                        return 0
+                price_str = d.get('price', '')
+                total_train += num_cell(18, price_str)
+                for col in range(19, 23): set_cell(col, '')
+
+            elif dtype == 'contract':
+                set_cell(5, d.get('sign_date', ''), align=center())
+                for col in range(6, 19): set_cell(col, '')
+                set_cell(19, d.get('contract_name', ''))
+                set_cell(20, d.get('party_a', ''))
+                set_cell(21, d.get('party_b', ''))
+                total_contract += num_cell(22, d.get('amount', ''))
+
+            else:  # invoice
+                set_cell(5, d.get('date', ''), align=center())
                 set_cell(6,  d.get('invoice_number', ''), align=center())
                 set_cell(7,  d.get('buyer', ''))
                 set_cell(8,  d.get('supplier', ''))
-                num_cell(9,  tax_free)
-                num_cell(10, tax)
-                total_invoice += num_cell(11, amount)
-                # 火车票列留空
-                for col in range(12, 19):
-                    set_cell(col, '')
-            set_cell(19, '')
-            set_cell(20, '')
+                num_cell(9,  d.get('tax_free_amount', ''))
+                num_cell(10, d.get('tax_amount', ''))
+                total_invoice += num_cell(11, d.get('amount', ''))
+                for col in range(12, 23): set_cell(col, '')
+
+            set_cell(23, '')
             success_count += 1
         else:
             set_cell(1, item.get('filename', ''))
-            for col in range(2, 19):
-                set_cell(col, '')
+            for col in range(2, 23): set_cell(col, '')
             set_cell(3, '失败', align=center())
-            set_cell(19, item.get('error', ''))
-            set_cell(20, '')
+            set_cell(23, item.get('error', ''))
             fail_count += 1
 
         ws.row_dimensions[row_i].height = 18
@@ -1420,38 +1852,28 @@ def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> byte
     sc = ws.cell(row=sum_row, column=1,
                  value=f'合计：成功 {success_count} 张，失败 {fail_count} 张')
     sc.font = Font(name='微软雅黑', bold=True, size=10, color='FF333333')
-    sc.fill = fill(C_SUM_ROW)
-    sc.alignment = center()
-    sc.border = bdr
+    sc.fill = fill(C_SUM_ROW); sc.alignment = center(); sc.border = bdr
 
-    # 发票合计（第11列）
-    inv_sum = ws.cell(row=sum_row, column=11, value=total_invoice)
-    inv_sum.font = Font(name='微软雅黑', bold=True, size=10, color=C_INVOICE_HDR[2:])
-    inv_sum.fill = fill(C_SUM_ROW); inv_sum.border = bdr
-    inv_sum.alignment = center(); inv_sum.number_format = '#,##0.00'
+    def sum_cell(col, val, color):
+        c = ws.cell(row=sum_row, column=col, value=val)
+        c.font = Font(name='微软雅黑', bold=True, size=10, color=color)
+        c.fill = fill(C_SUM_ROW); c.border = bdr
+        c.alignment = center(); c.number_format = '#,##0.00'
 
-    inv_lbl = ws.cell(row=sum_row, column=10, value='发票总额 ▶')
-    inv_lbl.font = Font(name='微软雅黑', bold=True, size=9); inv_lbl.fill = fill(C_SUM_ROW)
-    inv_lbl.border = bdr; inv_lbl.alignment = center()
+    def sum_lbl(col, txt):
+        c = ws.cell(row=sum_row, column=col, value=txt)
+        c.font = Font(name='微软雅黑', bold=True, size=9)
+        c.fill = fill(C_SUM_ROW); c.border = bdr; c.alignment = center()
 
-    # 火车票合计（第18列）
-    trn_sum = ws.cell(row=sum_row, column=18, value=total_train)
-    trn_sum.font = Font(name='微软雅黑', bold=True, size=10, color=C_TRAIN_HDR[2:])
-    trn_sum.fill = fill(C_SUM_ROW); trn_sum.border = bdr
-    trn_sum.alignment = center(); trn_sum.number_format = '#,##0.00'
+    sum_lbl(10, '发票总额 ▶'); sum_cell(11, total_invoice, C_INVOICE_HDR[2:])
+    sum_lbl(17, '火车票总额 ▶'); sum_cell(18, total_train,   C_TRAIN_HDR[2:])
+    sum_lbl(21, '合同总额 ▶');  sum_cell(22, total_contract, C_CONTRACT_HDR[2:])
 
-    trn_lbl = ws.cell(row=sum_row, column=17, value='火车票总额 ▶')
-    trn_lbl.font = Font(name='微软雅黑', bold=True, size=9); trn_lbl.fill = fill(C_SUM_ROW)
-    trn_lbl.border = bdr; trn_lbl.alignment = center()
-
-    # 其余汇总格
-    for col in [5,6,7,8,9,12,13,14,15,16,19,20]:
+    for col in [5,6,7,8,9,12,13,14,15,16,19,20,23]:
         c = ws.cell(row=sum_row, column=col, value='')
         c.fill = fill(C_SUM_ROW); c.border = bdr
 
     ws.row_dimensions[sum_row].height = 22
-
-    # ---- 冻结首两行 ----
     ws.freeze_panes = 'A3'
 
     buf = io.BytesIO()
@@ -1513,20 +1935,19 @@ def update_item(session_id, item_index):
     doc_type     = item.get('doc_type', 'invoice')
     d            = item.get('data') or {}
 
-    # 更新字段（发票 + 火车票字段均接受，只更新有值的）
+    # 更新字段（发票 + 火车票 + 合同字段均接受，只更新有值的）
     all_fields = ('date', 'invoice_number', 'buyer', 'supplier',
                   'tax_free_amount', 'tax_amount', 'amount',
                   'train_number', 'depart_time', 'from_station', 'to_station',
-                  'passenger_name', 'seat', 'seat_type', 'price')
+                  'passenger_name', 'seat', 'seat_type', 'price',
+                  'contract_name', 'sign_date', 'party_a', 'party_b')
     for field in all_fields:
         if field in payload:
             d[field] = payload[field].strip()
     item['data'] = d
 
     ext          = os.path.splitext(old_new_name)[1].lower()
-    new_new_name = (generate_train_filename(d, ext)
-                    if doc_type == 'train'
-                    else generate_filename(d, ext))
+    new_new_name = _generate_any_filename(d, doc_type, ext)
     item['new_name'] = new_new_name
 
     old_path = os.path.join(session_dir, old_new_name)
