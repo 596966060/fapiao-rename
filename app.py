@@ -146,6 +146,8 @@ class InvoiceExtractor:
            "购\n名称:XX" → "购买方名称:XX"
         2. "销售方信息" 作为大标题，下面跟"名称:" 字段
         3. 机动车/航空/其他发票格式兼容
+        4. OCR 误读修复：购→构/沟，销→消/晓，名→1/l 等
+        5. 支持"客户名称""收款方"等替代标签统一为购买方/销售方
         """
         lines = text.split('\n')
         out = []
@@ -153,28 +155,89 @@ class InvoiceExtractor:
         while i < len(lines):
             raw = lines[i]
             stripped = raw.strip()
-            # 向前看：下一行是否以"名称:" 开头（含OCR常见误读 "1称:" / "l称:"）
+
+            # ---- OCR 误读修复（逐行预处理）----
+            # 购买方相关：构买方/沟买方/构方/沟方/构买万 → 购买方
+            stripped = re.sub(r'^(构|沟)(?:买?方?)(?:信息)?$', '购买方', stripped)
+            stripped = re.sub(r'^(构|沟)(?:买?方?)\s*(?:信息)?$', '购买方', stripped)
+            # 销售方相关：消售方/晓售方/消方/消售万 → 销售方
+            stripped = re.sub(r'^(消|晓)(?:售?方?)(?:信息)?$', '销售方', stripped)
+            stripped = re.sub(r'^(消|晓)(?:售?方?)\s*(?:信息)?$', '销售方', stripped)
+            # 买方/卖方（住宿发票常用）
+            stripped = re.sub(r'^(构|沟)(?:买)(?:万|放)?(?:信息)?$', '买方', stripped)
+            stripped = re.sub(r'^(消|晓)(?:卖)(?:万|放)?(?:信息)?$', '卖方', stripped)
+            # 名称: → OCR 误读 "1称:" / "l称:" / "1秄:" / "名称∶"
+            stripped = re.sub(r'^([1l])\s*[称秄][：:﹕∶]', '名称:', stripped)
+            # 销售方信息（大字标题）→ 统一
+            stripped = re.sub(r'^销\s*售\s*方\s*信\s*息', '销售方信息', stripped)
+            stripped = re.sub(r'^购\s*买\s*方\s*信\s*息', '购买方信息', stripped)
+            # OCR 把"售"读成"害/室/富"，把"方"读成"万/放/仿"
+            stripped = re.sub(r'^销[害室富][万放仿]?(?:信息)?$', '销售方', stripped)
+            stripped = re.sub(r'^购[害室富]?[万放仿]?(?:信息)?$', '购买方', stripped)
+
+            # ---- 替代标签统一 ----
+            # "客户名称:" / "客户名称" → 购买方名称:
+            stripped = re.sub(r'客户名称[：:]', '购买方名称:', stripped)
+            stripped = re.sub(r'客户名称$', '购买方名称:', stripped)
+            # "付款方:" → 购买方名称:
+            stripped = re.sub(r'付款方[：:]', '购买方名称:', stripped)
+            stripped = re.sub(r'付款方$', '购买方名称:', stripped)
+            # "收款方:" → 销售方名称:
+            stripped = re.sub(r'收款方[：:]', '销售方名称:', stripped)
+            stripped = re.sub(r'收款方$', '销售方名称:', stripped)
+            # "供应方:" → 销售方名称:
+            stripped = re.sub(r'供应方[：:]', '销售方名称:', stripped)
+            stripped = re.sub(r'供应方$', '销售方名称:', stripped)
+            # "卖方名称:" → 销售方名称:
+            stripped = re.sub(r'卖方[名1l][称秄][：:]', '销售方名称:', stripped)
+            stripped = re.sub(r'卖方$', '销售方名称:', stripped)
+            # "买方名称:" → 购买方名称:
+            stripped = re.sub(r'买方[名1l][称秄][：:]', '购买方名称:', stripped)
+            stripped = re.sub(r'买方$', '购买方名称:', stripped)
+
+            # ---- 跨行标签重建 ----
+            # 向前看：下一行是否以"名称:" 开头（含OCR常见误读）
             if i + 1 < len(lines):
                 nxt = lines[i + 1].strip()
-                nxt_is_name = bool(re.match(r'[名1l][称称][：:﹕]', nxt))
+                nxt_is_name = bool(re.match(r'[名1l]\s*[称秄][：:﹕]', nxt))
                 if nxt_is_name:
-                    # 孤立的购方标签
-                    if re.fullmatch(r'购(?:买方?|方)?(?:信息)?', stripped):
+                    # 孤立的购方标签（含OCR误读变体）
+                    if re.fullmatch(r'(?:购|构|沟)(?:买?方?|方)?(?:信息)?', stripped):
                         out.append('购买方' + nxt)
                         i += 2
                         continue
-                    # 孤立的销方标签
-                    if re.fullmatch(r'销(?:售方?|方)?(?:信息)?', stripped):
+                    # 孤立的销方标签（含OCR误读变体）
+                    if re.fullmatch(r'(?:销|消|晓)(?:售?方?|方)?(?:信息)?', stripped):
                         out.append('销售方' + nxt)
                         i += 2
                         continue
-            # 机动车发票：把"销货单位"/"购货单位"统一为标准标签
+                    # 孤立的"买"标签（住宿发票常用"买方"）
+                    if re.fullmatch(r'(?:买|构买)', stripped):
+                        out.append('购买方' + nxt)
+                        i += 2
+                        continue
+                    # 孤立的"卖/销"标签
+                    if re.fullmatch(r'(?:卖|消|晓|销)', stripped):
+                        out.append('销售方' + nxt)
+                        i += 2
+                        continue
+                    # 孤立的"客户"标签
+                    if re.fullmatch(r'客户', stripped):
+                        out.append('购买方' + nxt)
+                        i += 2
+                        continue
+                    # 孤立的"收款"标签
+                    if re.fullmatch(r'收款', stripped):
+                        out.append('销售方' + nxt)
+                        i += 2
+                        continue
+
+            # ---- 机动车发票标签统一 ----
             stripped = re.sub(r'销货单位名称', '销售方名称', stripped)
             stripped = re.sub(r'购货单位名称', '购买方名称', stripped)
             stripped = re.sub(r'销货单位[：:]', '销售方名称：', stripped)
             stripped = re.sub(r'购货单位[：:]', '购买方名称：', stripped)
-            # 航空行程单：把"旅客姓名"当购买方
-            # (保持原行，由后续专项逻辑处理)
+
             out.append(raw[:raw.find(lines[i].lstrip())] + stripped if stripped != raw.strip() else raw)
             i += 1
         return '\n'.join(out)
@@ -213,9 +276,23 @@ class InvoiceExtractor:
         # ---- 出租车发票 ----
         if re.search(r'出租汽车|出租车发票|计价器', text):
             result['invoice_type'] = '出租车发票'
-            m = re.search(r'(?:金额|合计)[：:\s]*[¥￥]?\s*(\d+(?:\.\d{1,2})?)', text)
+            # 出租车发票通常有"客户名称""付款方"作为购买方，"收款方""供应方"作为销售方
+            # 优先从 _normalize_text 处理后的文本中提取（标签已统一）
+            buyer_m = re.search(r'(?:购买方|客户|付款方)[：:\s]*([\u4e00-\u9fa5]{2,30}(?:公司|集团|有限|企业|中心)?)', text)
+            if buyer_m:
+                result.setdefault('buyer', buyer_m.group(1).strip())
+            supplier_m = re.search(r'(?:销售方|收款方|供应方|运营公司)[：:\s]*([\u4e00-\u9fa5]{2,30}(?:公司|集团|有限|企业|中心)?)', text)
+            if supplier_m:
+                result.setdefault('supplier', supplier_m.group(1).strip())
+            # 金额
+            m = re.search(r'(?:金额|合计|票价)[：:\s]*[¥￥]?\s*(\d+(?:\.\d{1,2})?)', text)
             if m:
                 result['amount'] = f"{float(m.group(1)):.2f}"
+            # 日期
+            if not result.get('date'):
+                dm = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})', text)
+                if dm:
+                    result['date'] = f"{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}"
             return True
 
         # ---- 定额发票 ----
@@ -390,17 +467,37 @@ class InvoiceExtractor:
         explicit_both = re.search(
             r'购买方\s*名称[：:]\s*(.+?)\s+销售方\s*名称[：:]\s*([^\n]+)', text)
 
-        # 策略1: 购买方——多模式，支持跨行
+        # 策略1: 购买方——多模式，支持跨行，含OCR误读和替代标签
         buyer_raw = (
             _multiline_company(text, r'购买方\s*名称[：:]')
-            or _multiline_company(text, r'(?:购买方|购\s*方|买\s*方)[^\n]{0,30}?[1l名]称[：:]')
+            or _multiline_company(text, r'(?:购买方|购\s*方|买\s*方)[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            # OCR 误读变体
+            or _multiline_company(text, r'(?:构|沟)买方?[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'(?:构|沟)\s*方[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            # 替代标签：客户名称 / 付款方
+            or _multiline_company(text, r'客户名称[：:]')
+            or _multiline_company(text, r'付款方[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'付款方[：:]')
         )
 
-        # 策略1: 销售方——多模式，支持跨行
+        # 策略1: 销售方——多模式，支持跨行，含OCR误读和替代标签
         supplier_raw = (
             _multiline_company(text, r'销售方\s*名称[：:]')
-            or _multiline_company(text, r'(?:销售方|销\s*方|卖\s*方)[^\n]{0,30}?[1l名]称[：:]')
-            or _multiline_company(text, r'销[^\n]{0,20}?名称[：:]')
+            or _multiline_company(text, r'(?:销售方|销\s*方|卖\s*方)[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'销[^\n]{0,20}?[名1l]\s*[称秄][：:]')
+            # OCR 误读变体：消售/晓售/销害/销室/销富
+            or _multiline_company(text, r'(?:消|晓)售方?[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'(?:消|晓)\s*方[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'销[害室富][万放仿]?[^\n]{0,30}?[名1l]\s*[称][：:]')
+            # 替代标签：收款方 / 供应方 / 卖方 / 经营方 / 服务提供方
+            or _multiline_company(text, r'收款方[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'收款方[：:]')
+            or _multiline_company(text, r'供应方[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'供应方[：:]')
+            or _multiline_company(text, r'卖方[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'卖方[：:]')
+            or _multiline_company(text, r'(?:经营方|服务提供方)[^\n]{0,30}?[名1l]\s*[称秄][：:]')
+            or _multiline_company(text, r'(?:经营方|服务提供方)[：:]')
         )
 
         # 优先级：explicit_both > 策略1个别匹配 > same_line_both
@@ -429,7 +526,9 @@ class InvoiceExtractor:
         # 注意：用 [ \t]* 而非 \s* 避免跨行消耗（\s 会匹配换行符）
         if not result["buyer"] or not result["supplier"]:
             company_lines = []
-            for pat in (r'[1l名]称[：:][ \t]*([^\n]+)', r'名称[：:][ \t]*([^\n]+)'):
+            # 支持 "名称:" / "1称:" / "l称:" / "1秄:" 等OCR变体
+            for pat in (r'[名1l]\s*[称秄][：:][ \t]*([^\n]+)', r'名称[：:][ \t]*([^\n]+)',
+                        r'客户名称[：:][ \t]*([^\n]+)', r'收款方[：:][ \t]*([^\n]+)'):
                 for m in re.findall(pat, text):
                     c = clean_company(m)
                     if c and c not in company_lines:
@@ -442,9 +541,22 @@ class InvoiceExtractor:
             if len(company_lines) < 2:
                 # 先把开户行/开户银行所在行从文本里剔除，防止误匹配
                 text_no_bank = re.sub(r'(?m)^[^\n]*(?:开户行|开户银行|银行账号|账号)[^\n]*$', '', text)
+                # 也剔除纳税人识别号行和主管税务行
+                text_no_bank = re.sub(r'(?m)^[^\n]*(?:纳税人识别号|统一社会信用代码|主管税务)[^\n]*$', '', text_no_bank)
                 for mat in re.finditer(
                     r'[\u4e00-\u9fa5]{2,}(?:公司|有限|分公司|集团|股份|企业|'
                     r'研究所|医院|学校|协会|中心|院|所|厂|部)', text_no_bank
+                ):
+                    c = clean_company(mat.group(0))
+                    if c and c not in company_lines:
+                        company_lines.append(c)
+
+            # 策略3b: 如果仍然不够2个公司，尝试从整段文本中扫描
+            # 住宿发票中销售方经常是酒店名（如"XX酒店"、"XX宾馆"、"XX饭店"）
+            if len(company_lines) < 2:
+                for mat in re.finditer(
+                    r'[\u4e00-\u9fa5]{2,}(?:酒店|宾馆|饭店|旅馆|招待所|公寓|'
+                    r'出租(?:汽车)?公司|客运公司)', text_no_bank
                 ):
                     c = clean_company(mat.group(0))
                     if c and c not in company_lines:
@@ -591,6 +703,41 @@ def generate_train_filename(data: dict, original_ext: str) -> str:
 
 # ======================== 火车票提取 ========================
 
+# T3出行/网约车关键词集合（用于类型检测，优先级高于火车票）
+_T3_KEYWORDS = re.compile(
+    r'T3\s*出行|T3出行|滴滴出行|滴滴打车|曹操出行|高德打车|美团打车|'
+    r'花小猪|首汽约车|享道出行|如祺出行|阳光出行|万顺叫车|'
+    r'网约车|电子行程单|出行服务|打车电子发票|出租汽车电子发票|'
+    r'运客(?:费|服务)|客运(?:服务|费)|运输服务|出行平台'
+)
+
+
+def _abbreviate_city(name: str) -> str:
+    """城市名简写：取前2个汉字（如"上海虹桥"→"上海"，"北京南站"→"北京"）"""
+    if not name:
+        return ''
+    # 去掉常见后缀
+    name = re.sub(r'(?:市|区|县|站|机场|虹桥|南站|北站|东站|西站)$', '', name)
+    # 取前2个汉字
+    m = re.match(r'([\u4e00-\u9fa5]{1,2})', name)
+    return m.group(1) if m else name[:2]
+
+
+def generate_t3_filename(data: dict, original_ext: str) -> str:
+    """生成T3出行/网约车发票新文件名: 日期_出发地简写-到达地简写_金额元.ext"""
+    date    = data.get('date') or '0000-01-01'
+    from_city = _abbreviate_city(data.get('from_station') or data.get('from_city') or '')
+    to_city   = _abbreviate_city(data.get('to_station') or data.get('to_city') or '')
+    price   = data.get('price') or data.get('amount') or '0.00'
+
+    route = f"{from_city}-{to_city}" if (from_city or to_city) else ''
+    parts = [p for p in [date, route, f"{float(price):.2f}元"] if p]
+    new_name = '_'.join(parts) + original_ext
+    new_name = re.sub(r'[\\/:*?"<>|]', '', new_name)
+    new_name = re.sub(r'_+', '_', new_name).strip('_')
+    return new_name or f"t3_{datetime.now().strftime('%Y%m%d%H%M%S')}{original_ext}"
+
+
 # 火车票关键词集合（用于类型检测）
 _TRAIN_KEYWORDS = re.compile(
     r'车\s*次|检\s*票|候\s*车|动\s*车|高\s*铁|火\s*车\s*票|硬\s*卧|软\s*卧|硬\s*座|'
@@ -614,7 +761,10 @@ _CONTRACT_STRONG   = re.compile(
 
 
 def detect_doc_type(text: str) -> str:
-    """根据 OCR 文本判断是火车票/合同/发票，返回 'train'/'contract'/'invoice'"""
+    """根据 OCR 文本判断是火车票/合同/发票，返回 't3'/'train'/'contract'/'invoice'"""
+    # 0. T3出行/网约车（优先级最高，避免被误判为火车票）
+    if _T3_KEYWORDS.search(text):
+        return 't3'
     # 1. 强火车票关键词（优先级最高）
     if _TRAIN_KEYWORDS.search(text):
         return 'train'
@@ -1225,13 +1375,60 @@ def generate_contract_filename(data: dict, original_ext: str) -> str:
 
 
 def _extract_text_from_docx(docx_path: str) -> str:
-    """从 Word (.docx) 文件提取纯文本"""
+    """从 Word (.docx / .doc) 文件提取纯文本"""
+    # 优先尝试 python-docx（支持 .docx）
     try:
         import docx as _docx
         doc = _docx.Document(docx_path)
-        return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+        text = '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+        if text:
+            return text
     except Exception:
-        return ''
+        pass
+
+    # 回退：尝试读取 .doc 文件（旧格式，python-docx 不支持）
+    # 方法1：尝试 doc2docx 转换
+    try:
+        from doc2docx import convert as _convert
+        import tempfile
+        tmp_dir = tempfile.mkdtemp()
+        tmp_docx = os.path.join(tmp_dir, 'converted.docx')
+        _convert(docx_path, tmp_docx)
+        import docx as _docx2
+        doc2 = _docx2.Document(tmp_docx)
+        text = '\n'.join(p.text for p in doc2.paragraphs if p.text.strip())
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if text:
+            return text
+    except Exception:
+        pass
+
+    # 方法2：尝试用 win32com（仅 Windows 有效）
+    if sys.platform == 'win32':
+        try:
+            import win32com.client as _win32
+            word = _win32.Dispatch('Word.Application')
+            doc = word.Documents.Open(docx_path)
+            text = doc.Content.Text
+            doc.Close()
+            word.Quit()
+            if text and text.strip():
+                return text.strip()
+        except Exception:
+            pass
+
+    # 方法3：尝试作为纯文本读取（某些 .doc 文件可以部分提取）
+    try:
+        with open(docx_path, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+            # 过滤掉二进制噪音
+            clean = re.sub(r'[^\x20-\x7E\u4e00-\u9fa5\n\r\t]', '', text)
+            if len(clean) > 50:
+                return clean
+    except Exception:
+        pass
+
+    return ''
 
 
 def _pdf_contract_pages_text(pdf_path: str, reader, inv_extractor, max_pages: int = 8) -> str:
@@ -1285,6 +1482,8 @@ def _generate_any_filename(data: dict, doc_type: str, out_ext: str) -> str:
     """根据文档类型选择对应的命名函数"""
     if doc_type == 'train':
         return generate_train_filename(data, out_ext)
+    if doc_type == 't3':
+        return generate_t3_filename(data, out_ext)
     if doc_type == 'contract':
         return generate_contract_filename(data, out_ext)
     return generate_filename(data, out_ext)
@@ -1416,6 +1615,10 @@ def smart_extract(file_path: str, reader) -> tuple:
 
     if doc_type == 'train':
         fields = train._extract_fields(text, fp.stem)
+    elif doc_type == 't3':
+        # T3出行/网约车：使用火车票提取逻辑（需要出发地/到达地），但命名用T3格式
+        fields = train._extract_fields(text, fp.stem)
+        fields['invoice_type'] = 'T3出行'
     elif doc_type == 'contract':
         fields = contract._extract_fields(text)
     else:
@@ -1641,6 +1844,21 @@ def _build_csv_bytes(results: list) -> bytes:
                 try: total_train += float(price) if price else 0
                 except ValueError: pass
 
+            elif dtype == 't3':
+                # T3出行/网约车：使用火车票字段但显示为出行服务
+                price = d.get('price') or d.get('amount', '')
+                writer.writerow([
+                    item.get('filename', ''), item.get('new_name', ''), '成功', '🚗 T3出行',
+                    d.get('date', ''),
+                    *EMPTY6,                          # 发票列留空
+                    d.get('train_number', ''), d.get('from_station', ''),
+                    d.get('to_station', ''), d.get('passenger_name', ''),
+                    d.get('seat', ''), d.get('seat_type', ''), price,
+                    *EMPTY4, ''                        # 合同列留空 + 错误
+                ])
+                try: total_train += float(price) if price else 0
+                except ValueError: pass
+
             elif dtype == 'contract':
                 amount = d.get('amount', '')
                 writer.writerow([
@@ -1781,6 +1999,8 @@ def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> byte
             row_fill = fill(C_FAIL_ROW)
         elif dtype == 'train':
             row_fill = fill(C_TRAIN_ROW)
+        elif dtype == 't3':
+            row_fill = fill(C_TRAIN_ROW)  # T3出行用火车票底色
         elif dtype == 'contract':
             row_fill = fill(C_CONTRACT_ROW)
         else:
@@ -1808,13 +2028,13 @@ def _build_excel_bytes(results: list, title: str = '识别结果汇总') -> byte
 
         if is_ok:
             # 公共列
-            type_labels = {'train': '火车票', 'contract': '合同', 'invoice': '发票'}
+            type_labels = {'train': '火车票', 't3': '🚗 T3出行', 'contract': '合同', 'invoice': '发票'}
             set_cell(1, item.get('filename', ''))
             set_cell(2, item.get('new_name', ''), bold=True)
             set_cell(3, '成功', align=center())
             set_cell(4, type_labels.get(dtype, '发票'), align=center())
 
-            if dtype == 'train':
+            if dtype in ('train', 't3'):
                 set_cell(5, d.get('date', ''), align=center())
                 for col in range(6, 12): set_cell(col, '')
                 set_cell(12, d.get('train_number', ''), align=center())
